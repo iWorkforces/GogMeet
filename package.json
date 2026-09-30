@@ -1,6 +1,6 @@
 {
   "name": "gogmeet",
-  "version": "2.0.6",
+  "version": "2.0.7",
   "author": "iworkforces Engineers",
   "repository": "https://github.com/iworkforces/GogMeet",
   "authorEmail": "chitrung09t2@gmail.com",
@@ -19,7 +19,7 @@
     "@vitest/browser": "^5.0.2",
     "@vitest/coverage-v8": "^5.0.2",
     "@vitest/ui": "^5.0.2",
-    "electron": "^44.5.0",
+    "electron": "^44.5.1",
     "electron-builder": "^26.15.3",
     "eslint": "^10.11.0",
     "eslint-config-prettier": "^10.1.8",
