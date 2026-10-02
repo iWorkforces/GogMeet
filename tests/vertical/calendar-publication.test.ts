@@ -15,6 +15,8 @@ const loopback = vi.hoisted(() => {
   const handlers = new Map<string, InvokeHandler>();
   const listeners = new Map<string, Set<RendererListener>>();
   const senderFrame = { url: "https://invalid.example/" };
+  const sender = { isDestroyed: vi.fn(() => false) };
+  const senderWindow = { webContents: sender, isDestroyed: vi.fn(() => false) };
   const settings = { current: null as object | null };
 
   const removeListener = vi.fn((channel: string, listener: RendererListener) => {
@@ -29,7 +31,7 @@ const loopback = vi.hoisted(() => {
       if (handler === undefined) {
         throw new Error(`No loopback handler registered for ${channel}`);
       }
-      return handler({ senderFrame }, ...args);
+      return handler({ senderFrame, sender }, ...args);
     }),
     on: vi.fn((channel: string, listener: RendererListener) => {
       const channelListeners = listeners.get(channel) ?? new Set<RendererListener>();
@@ -47,6 +49,9 @@ const loopback = vi.hoisted(() => {
     settings,
     removeListener,
     electron: {
+      BrowserWindow: {
+        fromWebContents: vi.fn((candidate: object) => (candidate === sender ? senderWindow : null)),
+      },
       app: {
         getAppPath: vi.fn(() => "/app"),
         getPath: vi.fn(() => "/tmp/gogmeet-vertical"),

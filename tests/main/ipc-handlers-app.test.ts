@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { registerAppHandlers } from "../../src/main/ipc-handlers/app.js";
-import { ipcMain, app } from "electron";
+import { ipcMain, app, BrowserWindow } from "electron";
 import { authorizedInvokeEvent } from "../helpers/ipc-sender.js";
 import { testAppGraph } from "../helpers/app-graph.js";
 
@@ -21,7 +21,7 @@ const unauthorizedEvent = {
   senderFrame: { url: "https://evil.com/" },
 }.As<import("electron").IpcMainInvokeEvent>();
 
-const authorizedEvent = authorizedInvokeEvent("index").As<import("electron").IpcMainInvokeEvent>();
+let authorizedEvent: import("electron").IpcMainInvokeEvent;
 
 function appGraphForTest() {
   return testAppGraph({
@@ -36,6 +36,14 @@ describe("registerAppHandlers", () => {
     mockApp.getVersion.mockReturnValue("1.0.0");
     mockOpenMeetingUrl.mockResolvedValue({ ok: true, value: undefined });
     mockJoinMeetingById.mockResolvedValue({ ok: true, value: undefined });
+    const win = {
+      webContents: { isDestroyed: vi.fn(() => false) },
+      isDestroyed: vi.fn(() => false),
+    }.As<BrowserWindow>();
+    BrowserWindow.fromWebContents = vi.fn((sender) => (sender === win.webContents ? win : null));
+    authorizedEvent = { ...authorizedInvokeEvent("index"), sender: win.webContents }.As<
+      import("electron").IpcMainInvokeEvent
+    >();
   });
 
   it("registers 3 handlers", () => {
@@ -86,6 +94,16 @@ describe("registerAppHandlers", () => {
   });
 
   describe("app:join-meeting", () => {
+    it("rejects a forged sender even with an authorized frame URL", async () => {
+      registerAppHandlers(appGraphForTest());
+      const result = await getRegisteredHandler("app:join-meeting")(
+        authorizedInvokeEvent("index"),
+        { id: "evt-1", alert: { epoch: 1 } },
+      );
+      expect(result).toMatchObject({ ok: false });
+      expect(mockJoinMeetingById).not.toHaveBeenCalled();
+    });
+
     it("joins by event id for authorized sender", async () => {
       registerAppHandlers(appGraphForTest());
       const handler = getRegisteredHandler("app:join-meeting");
