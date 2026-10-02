@@ -1,5 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { renderBody } from "../../../src/renderer/rendering/body.js";
+import type { CalendarProvenance } from "../../../src/renderer/lib/apply-events-push.js";
+import { calendarLiveOk, calendarOfflineOk } from "../../../src/domain/entities/calendar-result.js";
 import {
   createMockEvent,
   createMockSettings,
@@ -13,6 +15,11 @@ describe("renderBody", () => {
   // Pin time so relative-time labels and isTomorrow() are deterministic.
   // 2026-06-15T10:00:00Z → a Monday morning, not near midnight.
   const FIXED_NOW = new Date("2026-06-15T10:00:00Z").getTime();
+  const COMPLETE_PROVENANCE: CalendarProvenance = {
+    source: "live",
+    completeness: "complete",
+    observedAt: FIXED_NOW,
+  };
 
   beforeEach(() => {
     vi.useFakeTimers();
@@ -25,7 +32,7 @@ describe("renderBody", () => {
 
   describe("loading state", () => {
     it("renders spinner and loading text", () => {
-      const html = renderBody({ type: "loading" }, createMockSettings());
+      const html = renderBody({ type: "loading" }, createMockSettings(), null);
       expect(html).toContain('class="spinner"');
       expect(html).toContain("Loading your meetings...");
       expect(html).toContain('class="state-screen"');
@@ -34,7 +41,11 @@ describe("renderBody", () => {
 
   describe("no-permission state", () => {
     it("renders grant-access button when not retrying", () => {
-      const html = renderBody({ type: "no-permission", retrying: false }, createMockSettings());
+      const html = renderBody(
+        { type: "no-permission", retrying: false },
+        createMockSettings(),
+        null,
+      );
       expect(html).toContain("Calendar Access Needed");
       expect(html).toContain('data-action="grant-access"');
       expect(html).toContain("Grant Access");
@@ -42,7 +53,11 @@ describe("renderBody", () => {
     });
 
     it("renders disabled button with 'Requesting...' label when retrying", () => {
-      const html = renderBody({ type: "no-permission", retrying: true }, createMockSettings());
+      const html = renderBody(
+        { type: "no-permission", retrying: true },
+        createMockSettings(),
+        null,
+      );
       expect(html).toContain("Requesting...");
       expect(html).toContain("disabled");
     });
@@ -53,6 +68,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "no-events" },
         createMockSettings({ showTomorrowMeetings: false }),
+        COMPLETE_PROVENANCE,
       );
       expect(html).toContain("No upcoming meetings");
       expect(html).toContain("No calendar events found for today.");
@@ -63,6 +79,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "no-events" },
         createMockSettings({ showTomorrowMeetings: true }),
+        COMPLETE_PROVENANCE,
       );
       expect(html).toContain("today or tomorrow");
     });
@@ -73,6 +90,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "error", message: "Boom <script>alert(1)</script>" },
         createMockSettings(),
+        null,
       );
       expect(html).toContain("Something went wrong");
       expect(html).toContain('data-action="retry"');
@@ -89,7 +107,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(30)),
         endDate: asTestIsoUtc(isoFromNow(60)),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain('class="section-header"');
       expect(html).toContain("Today");
@@ -106,7 +128,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(-60)),
         endDate: asTestIsoUtc(isoFromNow(-30)),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("All done for today!");
       expect(html).toContain("No more upcoming meetings.");
@@ -126,7 +152,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(30)),
         endDate: asTestIsoUtc(isoFromNow(60)),
       });
-      const html = renderBody({ type: "has-events", events: [past, future] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [past, future] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("Future Meeting");
       expect(html).not.toContain("Past Meeting");
@@ -152,6 +182,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "has-events", events: [tomorrowEvent] },
         createMockSettings({ showTomorrowMeetings: true }),
+        COMPLETE_PROVENANCE,
       );
 
       expect(html).toContain('class="section-header"');
@@ -170,6 +201,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "has-events", events: [todayEvent] },
         createMockSettings({ showTomorrowMeetings: true }),
+        COMPLETE_PROVENANCE,
       );
 
       expect(html).toContain('<p class="section-header">Today</p>');
@@ -183,7 +215,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(30)),
         endDate: asTestIsoUtc(isoFromNow(60)),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("&lt;img src=x onerror=");
       expect(html).toContain("&amp;");
@@ -202,6 +238,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "has-events", events: [event] },
         createMockSettings({ openBeforeMinutes: 1 }),
+        COMPLETE_PROVENANCE,
       );
 
       expect(html).toContain('class="badge-auto"');
@@ -218,6 +255,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "has-events", events: [event] },
         createMockSettings({ openBeforeMinutes: 5 }),
+        COMPLETE_PROVENANCE,
       );
 
       expect(html).toContain("5 mins before");
@@ -231,10 +269,46 @@ describe("renderBody", () => {
         endDate: asTestIsoUtc(isoFromNow(60)),
         isAllDay: true,
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).not.toContain('class="badge-auto"');
     });
+
+    it.each(["disabled", "partial", "offline", "all-day", "no-url"] as const)(
+      "does not promise automatic opening for %s data while preserving eligible manual ID Join",
+      (reason) => {
+        // Given: explicit provenance and the relevant automation constraint.
+        const event = createMockEvent({
+          isAllDay: reason === "all-day",
+          ...(reason === "no-url" ? { meetUrl: undefined } : {}),
+        });
+        const provenance =
+          reason === "offline"
+            ? calendarOfflineOk([event], FIXED_NOW - 60_000, FIXED_NOW)
+            : calendarLiveOk([event], reason === "partial" ? "partial" : "complete", FIXED_NOW);
+
+        // When: the existing body renders the accepted list.
+        const html = renderBody(
+          { type: "has-events", events: [event] },
+          createMockSettings({ autoOpenEnabled: reason !== "disabled" }),
+          provenance,
+        );
+
+        // Then: the hint is absent, but a URL still permits manual ID Join.
+        expect(html).not.toContain('class="badge-auto"');
+        expect(html.includes('class="state-desc"')).toBe(
+          reason === "partial" || reason === "offline",
+        );
+        if (reason !== "no-url") {
+          expect(html).toContain(`data-event-id="${event.id}"`);
+          expect(html).not.toContain("data-url=");
+        }
+      },
+    );
 
     it("does NOT render Join button or auto-join badge for events without meetUrl", () => {
       const event = createMockEvent({
@@ -244,7 +318,11 @@ describe("renderBody", () => {
         endDate: asTestIsoUtc(isoFromNow(60)),
         meetUrl: undefined,
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).not.toContain('data-action="join-meeting"');
       expect(html).not.toContain('class="badge-auto"');
@@ -258,7 +336,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(30)),
         endDate: asTestIsoUtc(isoFromNow(60)),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain('class="meeting-title"');
       // Empty title produces an empty span body, but the structure is intact.
@@ -287,6 +369,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "has-events", events: [event1, event2, event3] },
         createMockSettings(),
+        COMPLETE_PROVENANCE,
       );
 
       const idx1 = html.indexOf("First Meeting");
@@ -308,7 +391,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(-5)),
         endDate: asTestIsoUtc(isoFromNow(25)),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("In progress");
       expect(html).toContain('class="meeting-time now"');
@@ -321,7 +408,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(-120)),
         endDate: asTestIsoUtc(isoFromNow(-50)),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).not.toContain("Afternoon Sync");
       expect(html).not.toContain("In progress");
@@ -339,6 +430,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [event] },
           createMockSettings({ showCompletedTodayMeetings: false }),
+          COMPLETE_PROVENANCE,
         );
         expect(html).toContain("All done for today!");
         expect(html).not.toContain("Completed today");
@@ -363,6 +455,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [earlier, later] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
 
         expect(html).toContain("Completed today");
@@ -401,6 +494,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [past, future] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
 
         expect(html).toContain("Future Meeting");
@@ -423,6 +517,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [live] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
         expect(html).toContain("In progress");
         expect(html).not.toContain("Completed today");
@@ -467,6 +562,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [priorDay, overnight, tomorrow] },
           createMockSettings({ showCompletedTodayMeetings: true, showTomorrowMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
 
         expect(html).not.toContain("Yesterday Meeting");
@@ -494,6 +590,7 @@ describe("renderBody", () => {
         const liveHtml = renderBody(
           { type: "has-events", events: [multiDayLive] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
         expect(liveHtml).toContain("Multi Day Live");
         expect(liveHtml).toContain("In progress");
@@ -513,6 +610,7 @@ describe("renderBody", () => {
         const endedHtml = renderBody(
           { type: "has-events", events: [multiDayEnded] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
         expect(endedHtml).not.toContain("Multi Day Ended");
         expect(endedHtml).not.toContain("Completed today");
@@ -530,6 +628,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [event] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
         expect(html).toContain("Just Ended");
         expect(html).toContain("Completed today");
@@ -547,6 +646,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [event] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
         expect(html).toContain("&lt;img src=x onerror=");
         expect(html).toContain("Evil &amp; &quot;Cal&quot;");
@@ -564,6 +664,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [event] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
         expect(html).toContain("No URL Done");
         expect(html).toContain("Completed today");
@@ -578,7 +679,11 @@ describe("renderBody", () => {
         startDate: asTestIsoUtc(isoFromNow(10)),
         endDate: asTestIsoUtc(isoFromNow(40)),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("In 10 min");
       expect(html).toContain('class="meeting-time soon"');
@@ -593,7 +698,11 @@ describe("renderBody", () => {
         calendarName: 'Work & "Home"',
         meetUrl: asTestMeetUrl("https://meet.google.com/xyz-abcd-efg"),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("Work &amp; &quot;Home&quot;");
       expect(html).toContain('data-event-id="evt-cal"');
@@ -609,7 +718,11 @@ describe("renderBody", () => {
           endDate: asTestIsoUtc(isoFromNow(60)),
           meetUrl: asTestMeetUrl("https://meet.google.com/abc-defg-hij"),
         });
-        const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+        const html = renderBody(
+          { type: "has-events", events: [event] },
+          createMockSettings(),
+          COMPLETE_PROVENANCE,
+        );
 
         // Display: head 12 + … + tail 12 (max 25 code points)
         expect(html).toContain(">Weekly Produ\u2026 with Design</span>");
@@ -627,7 +740,11 @@ describe("renderBody", () => {
           startDate: asTestIsoUtc(isoFromNow(30)),
           endDate: asTestIsoUtc(isoFromNow(60)),
         });
-        const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+        const html = renderBody(
+          { type: "has-events", events: [event] },
+          createMockSettings(),
+          COMPLETE_PROVENANCE,
+        );
         expect(html).toContain('title="Standup">Standup</span>');
       });
 
@@ -639,7 +756,11 @@ describe("renderBody", () => {
           startDate: asTestIsoUtc(isoFromNow(30)),
           endDate: asTestIsoUtc(isoFromNow(60)),
         });
-        const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+        const html = renderBody(
+          { type: "has-events", events: [event] },
+          createMockSettings(),
+          COMPLETE_PROVENANCE,
+        );
 
         expect(html).not.toContain("<script>alert(1)</script>");
         // Truncated form still HTML-escaped
@@ -658,6 +779,7 @@ describe("renderBody", () => {
         const html = renderBody(
           { type: "has-events", events: [event] },
           createMockSettings({ showCompletedTodayMeetings: true }),
+          COMPLETE_PROVENANCE,
         );
 
         expect(html).toContain("Completed today");
@@ -682,6 +804,7 @@ describe("renderBody", () => {
       const html = renderBody(
         { type: "has-events", events: [event] },
         createMockSettings({ openBeforeMinutes: 1 }),
+        COMPLETE_PROVENANCE,
       );
 
       expect(html).toContain("Zoom Standup");
@@ -699,7 +822,11 @@ describe("renderBody", () => {
         endDate: asTestIsoUtc(isoFromNow(60)),
         meetUrl: undefined,
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("Zoom No URL");
       expect(html).not.toContain('data-action="join-meeting"');
@@ -713,7 +840,11 @@ describe("renderBody", () => {
         endDate: asTestIsoUtc(isoFromNow(60)),
         meetUrl: asTestMeetUrl("https://acme.zoom.us/j/456?pwd=abc"),
       });
-      const html = renderBody({ type: "has-events", events: [event] }, createMockSettings());
+      const html = renderBody(
+        { type: "has-events", events: [event] },
+        createMockSettings(),
+        COMPLETE_PROVENANCE,
+      );
 
       expect(html).toContain("Acme Sync");
       expect(html).toContain('data-event-id="evt-zoom-sub"');

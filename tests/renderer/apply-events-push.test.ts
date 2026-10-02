@@ -1,19 +1,22 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { applyEventsPush } from "../../src/renderer/lib/apply-events-push.js";
+import type { CalendarProvenance } from "../../src/renderer/lib/apply-events-push.js";
 import type { AppState } from "../../src/shared/app-state.js";
 import { DEFAULT_SETTINGS } from "../../src/domain/entities/settings.js";
 import type { AppSettings } from "../../src/domain/entities/settings.js";
+import { calendarLiveOk, calendarOfflineOk } from "../../src/domain/entities/calendar-result.js";
 import { createMockEvent, isoFromNow } from "../helpers/test-utils.js";
 
 const FIXED_NOW = new Date(2026, 5, 15, 12, 0, 0).getTime();
+const COMPLETE_PROVENANCE: CalendarProvenance = {
+  source: "live",
+  completeness: "complete",
+  observedAt: FIXED_NOW,
+};
 
 function loadingState(): AppState {
   return { type: "loading" };
-}
-
-function hasEventsState(events: ReturnType<typeof createMockEvent>[]): AppState {
-  return { type: "has-events", events };
 }
 
 function settingsWith(overrides: Partial<AppSettings> = {}): AppSettings {
@@ -37,6 +40,8 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: loadingState(),
       prevSignature: "",
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: null,
     });
     expect(result.didChange).toBe(true);
     expect(result.state.type).toBe("has-events");
@@ -50,6 +55,8 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: loadingState(),
       prevSignature: "",
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: null,
     });
 
     const second = applyEventsPush({
@@ -57,6 +64,8 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: first.state,
       prevSignature: first.signature,
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: first.provenance,
     });
     expect(second.didChange).toBe(false);
     expect(second.signature).toBe(first.signature);
@@ -70,6 +79,8 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: loadingState(),
       prevSignature: "",
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: null,
     });
 
     const errorState: AppState = { type: "error", message: "boom" };
@@ -78,6 +89,8 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: errorState,
       prevSignature: first.signature,
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: first.provenance,
     });
     expect(second.didChange).toBe(true);
     expect(second.state.type).toBe("has-events");
@@ -90,6 +103,8 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: loadingState(),
       prevSignature: "",
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: null,
     });
 
     const updated = createMockEvent({
@@ -103,6 +118,8 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: first.state,
       prevSignature: first.signature,
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: first.provenance,
     });
     expect(second.didChange).toBe(true);
     expect(second.signature).not.toBe(first.signature);
@@ -116,12 +133,16 @@ describe("applyEventsPush", () => {
       settings: settingsWith(),
       prevState: loadingState(),
       prevSignature: "",
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: null,
     });
     const second = applyEventsPush({
       events: [b, a],
       settings: settingsWith(),
       prevState: first.state,
       prevSignature: first.signature,
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: first.provenance,
     });
     expect(second.didChange).toBe(false);
     expect(second.signature).toBe(first.signature);
@@ -140,6 +161,8 @@ describe("applyEventsPush", () => {
       settings,
       prevState: loadingState(),
       prevSignature: "",
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: null,
     });
     expect(first.didChange).toBe(true);
     expect(first.state.type).toBe("has-events");
@@ -149,6 +172,8 @@ describe("applyEventsPush", () => {
       settings,
       prevState: first.state,
       prevSignature: first.signature,
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: first.provenance,
     });
     expect(second.didChange).toBe(false);
     expect(second.signature).toBe(first.signature);
@@ -162,8 +187,72 @@ describe("applyEventsPush", () => {
       settings: settingsWith({ showTomorrowMeetings: false }),
       prevState: loadingState(),
       prevSignature: "",
+      provenance: COMPLETE_PROVENANCE,
+      prevProvenance: null,
     });
     expect(result.didChange).toBe(true);
     expect(result.state.type).toBe("no-events");
   });
+
+  it.each(["partial", "offline", "observedAt"] as const)(
+    "retains a provenance-only %s change when the row signature is unchanged",
+    (change) => {
+      // Given: the same post-filter rows were accepted as live complete.
+      const events = [createMockEvent()];
+      const initial = calendarLiveOk(events, "complete", FIXED_NOW - 60_000);
+      const first = applyEventsPush({
+        events,
+        settings: settingsWith(),
+        prevState: loadingState(),
+        prevSignature: "",
+        provenance: initial,
+        prevProvenance: null,
+      });
+      const provenance =
+        change === "offline"
+          ? calendarOfflineOk(events, FIXED_NOW - 5 * 60_000, FIXED_NOW)
+          : calendarLiveOk(events, change === "partial" ? "partial" : "complete", FIXED_NOW);
+
+      // When: only provenance changes.
+      const next = applyEventsPush({
+        events,
+        settings: settingsWith(),
+        prevState: first.state,
+        prevSignature: first.signature,
+        provenance,
+        prevProvenance: initial,
+      });
+
+      // Then: rows stay retained, but the publication change is observable.
+      expect(next.didChange).toBe(true);
+      expect(next.state).toEqual(first.state);
+      expect(next).toMatchObject({ provenance });
+    },
+  );
+
+  it.each(["partial", "offline"] as const)(
+    "retains %s provenance even when tomorrow filtering leaves an empty list",
+    (kind) => {
+      // Given: a degraded result whose only row is hidden by the setting.
+      const events = [createMockEvent({ startDate: isoFromNow(24 * 60) })];
+      const provenance =
+        kind === "offline"
+          ? calendarOfflineOk(events, FIXED_NOW - 10 * 60_000, FIXED_NOW)
+          : calendarLiveOk(events, "partial", FIXED_NOW);
+
+      // When: the result is reduced to empty displayed rows.
+      const next = applyEventsPush({
+        events,
+        settings: settingsWith({ showTomorrowMeetings: false }),
+        prevState: loadingState(),
+        prevSignature: "",
+        provenance,
+        prevProvenance: null,
+      });
+
+      // Then: empty display is not confused with complete/live provenance.
+      expect(next.state.type).toBe("no-events");
+      expect(next).toMatchObject({ provenance });
+    },
+  );
 });
