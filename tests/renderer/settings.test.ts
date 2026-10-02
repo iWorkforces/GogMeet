@@ -118,6 +118,12 @@ describe("settings/index.ts", () => {
     return toggle;
   }
 
+  function getToggle(id: string): HTMLInputElement {
+    const toggle = document.getElementById(id);
+    if (!(toggle instanceof HTMLInputElement)) throw new Error(`Missing toggle ${id}`);
+    return toggle;
+  }
+
   function refreshWhenVisible(): void {
     Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
     document.dispatchEvent(new Event("visibilitychange"));
@@ -420,6 +426,81 @@ describe("settings/index.ts", () => {
     await vi.waitFor(() => expect(setSettings).toHaveBeenCalledTimes(2));
     expect(setSettings).toHaveBeenLastCalledWith({ launchAtLogin: true });
   });
+
+  it.each(["active", "merged"] as const)(
+    "settles all queued callers and recovers when the %s save fails",
+    async (failedSave) => {
+      const first = Promise.withResolvers<AppSettings>();
+      const merged = Promise.withResolvers<AppSettings>();
+      const setSettings = vi
+        .fn<(partial: Partial<AppSettings>) => Promise<AppSettings>>()
+        .mockReturnValueOnce(first.promise)
+        .mockImplementationOnce((partial) =>
+          failedSave === "merged"
+            ? merged.promise
+            : Promise.resolve({ ...DEFAULT_SETTINGS, ...partial }),
+        )
+        .mockImplementation(async (partial) => ({
+          ...DEFAULT_SETTINGS,
+          openBeforeMinutes: 2,
+          ...partial,
+        }));
+      await loadSettingsRenderer(setSettings);
+      const select = getOpenBeforeSelect();
+      select.value = "2";
+      select.dispatchEvent(new Event("change"));
+      const queued = [getLaunchAtLoginToggle(), getToggle("show-completed-meetings-toggle")];
+      for (const toggle of queued) {
+        toggle.checked = true;
+        toggle.dispatchEvent(new Event("change"));
+      }
+      expect(setSettings).toHaveBeenCalledTimes(1);
+      const pending: Array<{ readonly toggle: HTMLInputElement; readonly previous: boolean }> = [];
+      if (failedSave === "merged") {
+        first.resolve({ ...DEFAULT_SETTINGS, openBeforeMinutes: 2 });
+        await vi.waitFor(() => expect(setSettings).toHaveBeenCalledTimes(2));
+        expect(setSettings).toHaveBeenLastCalledWith({
+          launchAtLogin: true,
+          showCompletedTodayMeetings: true,
+        });
+        for (const id of ["show-tomorrow-toggle", "native-notif-toggle"]) {
+          const toggle = getToggle(id);
+          const previous = toggle.checked;
+          pending.push({ toggle, previous });
+          toggle.checked = !previous;
+          toggle.dispatchEvent(new Event("change"));
+        }
+        expect(setSettings).toHaveBeenCalledTimes(2);
+        merged.reject(new Error("merged persistence failed"));
+      } else {
+        first.reject(new Error("active persistence failed"));
+      }
+      await vi.waitFor(() => {
+        for (const toggle of queued) expect(toggle.checked).toBe(false);
+        for (const { toggle, previous } of pending) expect(toggle.checked).toBe(previous);
+        expect(document.querySelector(".settings-error")?.textContent).toContain(
+          `${failedSave} persistence failed`,
+        );
+      });
+      expect(getLaunchAtLoginToggle().checked).toBe(false);
+      expect(getToggle("show-completed-meetings-toggle").checked).toBe(false);
+      expect(getOpenBeforeSelect().value).toBe(
+        String(failedSave === "merged" ? 2 : DEFAULT_SETTINGS.openBeforeMinutes),
+      );
+      expect(document.querySelector(".save-indicator.visible")).toBeNull();
+      expect(document.getElementById("settings-main")?.hasAttribute("aria-busy")).toBe(false);
+      const callsBeforeRecovery = setSettings.mock.calls.length;
+      const recoveryToggle = getLaunchAtLoginToggle();
+      recoveryToggle.checked = true;
+      recoveryToggle.dispatchEvent(new Event("change"));
+      await vi.waitFor(() => {
+        expect(setSettings).toHaveBeenCalledTimes(callsBeforeRecovery + 1);
+        expect(document.getElementById("launch-save-indicator")?.textContent).toBe("Saved");
+      });
+      expect(setSettings).toHaveBeenLastCalledWith({ launchAtLogin: true });
+      expect(recoveryToggle.checked).toBe(true);
+    },
+  );
 
   it("uses defaults when calendar getUiState throws on init", async () => {
     const setSettings = vi.fn().mockImplementation(async (p: Partial<AppSettings>) => ({
