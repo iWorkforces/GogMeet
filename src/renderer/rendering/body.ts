@@ -143,7 +143,7 @@ export function renderBody(
       const sectionHeader = hasTomorrowEvents ? "Today & Tomorrow" : "Today";
 
       const parts: string[] = [];
-      if (calendarStatus) parts.push(`<p class="state-desc">${calendarStatus}</p>`);
+      if (calendarStatus) parts.push(`<p class="state-desc calendar-notice">${calendarStatus}</p>`);
       if (upcoming.length > 0) {
         parts.push(`<p class="section-header">${sectionHeader}</p>`);
         upcoming.forEach((event, i) => {

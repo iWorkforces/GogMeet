@@ -83,6 +83,24 @@ describe("renderBody", () => {
       );
       expect(html).toContain("today or tomorrow");
     });
+
+    it.each(["partial", "offline"] as const)(
+      "keeps centered description styling for empty %s calendar data",
+      (kind) => {
+        // Given: degraded calendar data with no displayed rows.
+        const provenance =
+          kind === "offline"
+            ? calendarOfflineOk([], FIXED_NOW - 60_000, FIXED_NOW)
+            : calendarLiveOk([], "partial", FIXED_NOW);
+
+        // When: the empty state renders its provenance description.
+        const html = renderBody({ type: "no-events" }, createMockSettings(), provenance);
+
+        // Then: the centered paragraph does not acquire the list-only gutter.
+        expect(html).toContain('class="state-desc"');
+        expect(html).not.toContain("calendar-notice");
+      },
+    );
   });
 
   describe("error state", () => {
@@ -300,7 +318,7 @@ describe("renderBody", () => {
 
         // Then: the hint is absent, but a URL still permits manual ID Join.
         expect(html).not.toContain('class="badge-auto"');
-        expect(html.includes('class="state-desc"')).toBe(
+        expect(html.includes('class="state-desc calendar-notice"')).toBe(
           reason === "partial" || reason === "offline",
         );
         if (reason !== "no-url") {
