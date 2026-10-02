@@ -1,4 +1,4 @@
-import type { BrowserWindow, IpcMainInvokeEvent } from "electron";
+import type { BrowserWindow, IpcMainInvokeEvent, WebContents } from "electron";
 import { IPC_CHANNELS, type IpcRequest, type IpcResponse } from "../../shared/ipc-channels.js";
 import type { AppGraph } from "../composition/app-graph.js";
 import { syncAutoLaunch } from "../system/auto-launch.js";
@@ -24,6 +24,17 @@ function settingsRequireSchedulerRestart(partial: Partial<AppSettings>): boolean
   return (Object.keys(partial) as (keyof AppSettings)[]).some((k) => TIMING_KEYS.has(k));
 }
 
+function runCommittedEffect(effect: () => void): void {
+  try {
+    effect();
+  } catch (err) {
+    console.error(
+      "[ipc] SETTINGS_SET post-commit effect error:",
+      err instanceof Error ? err : new Error(String(err)),
+    );
+  }
+}
+
 export function registerSettingsHandlers(win: BrowserWindow, graph: AppGraph): void {
   typedHandle(
     IPC_CHANNELS.SETTINGS_GET,
@@ -41,36 +52,41 @@ export function registerSettingsHandlers(win: BrowserWindow, graph: AppGraph): v
     ): Promise<IpcResponse<typeof IPC_CHANNELS.SETTINGS_SET>> => {
       if (!validateSender(event)) return { ...DEFAULT_SETTINGS };
       const updated = await graph.settings.update(partial);
-      try {
+
+      runCommittedEffect(() => {
         if (settingsRequireSchedulerRestart(partial)) {
           graph.scheduler.restart();
         } else if (typeof partial.showTomorrowMeetings === "boolean") {
-          void graph.scheduler.forcePoll({ reason: "user" });
+          void graph.scheduler.forcePoll({ reason: "user" }).catch((err: unknown) => {
+            console.error(
+              "[ipc] SETTINGS_SET force-poll error:",
+              err instanceof Error ? err : new Error(String(err)),
+            );
+          });
         } else if (typeof partial.showCompletedTodayMeetings === "boolean") {
           // Display-only: rebuild tray immediately so completed history appears without a poll.
           forceTrayMenuRefresh();
         }
+      });
 
-        if (typeof partial.launchAtLogin === "boolean") {
-          syncAutoLaunch(partial.launchAtLogin);
-        }
-
-        // Fan-out to popover and hide-cached Settings window when distinct.
-        typedSend(win.webContents, IPC_CHANNELS.SETTINGS_CHANGED, updated);
-        const settingsWin = getSettingsWindow();
-        if (
-          settingsWin &&
-          !settingsWin.isDestroyed() &&
-          settingsWin.webContents !== win.webContents &&
-          !settingsWin.webContents.isDestroyed()
-        ) {
-          typedSend(settingsWin.webContents, IPC_CHANNELS.SETTINGS_CHANGED, updated);
-        }
-        return updated;
-      } catch (err) {
-        console.error("[ipc] SETTINGS_SET error:", err);
-        return graph.settings.get();
+      const launchAtLogin = partial.launchAtLogin;
+      if (typeof launchAtLogin === "boolean") {
+        runCommittedEffect(() => {
+          syncAutoLaunch(launchAtLogin);
+        });
       }
+
+      const sent = new Set<WebContents>();
+      for (const target of new Set([win, getSettingsWindow()])) {
+        runCommittedEffect(() => {
+          if (!target || target.isDestroyed()) return;
+          const contents = target.webContents;
+          if (contents.isDestroyed() || sent.has(contents)) return;
+          sent.add(contents);
+          typedSend(contents, IPC_CHANNELS.SETTINGS_CHANGED, updated);
+        });
+      }
+      return updated;
     },
   );
 }

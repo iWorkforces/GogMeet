@@ -384,6 +384,127 @@ describe("registerSettingsHandlers", () => {
       }
     });
 
+    it.each(["restart", "forcePoll", "tray", "login", "popoverPush", "settingsPush"])(
+      "returns the committed result and continues independent deliveries when %s throws",
+      async (effect) => {
+        // Given a committed result and a failing post-commit effect.
+        const updated = { ...DEFAULT_SETTINGS, launchAtLogin: true, openBeforeMinutes: 5 };
+        mockUpdateSettings.mockResolvedValue(updated);
+        const popover = liveWindow();
+        const settings = liveWindow();
+        mockGetSettingsWindow.mockReturnValue(settings);
+        const error = new Error("effect failed");
+        const report = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        const effects = {
+          restart: mockRestartScheduler,
+          forcePoll: mockForcePoll,
+          tray: mockForceTrayMenuRefresh,
+          login: mockSyncAutoLaunch,
+          popoverPush: popover.webContents.send,
+          settingsPush: settings.webContents.send,
+        };
+        const failing = effects[effect];
+        if (!failing) throw new Error("Unknown effect fixture");
+        failing.mockImplementation(() => {
+          throw error;
+        });
+        const partial =
+          effect === "tray"
+            ? { showCompletedTodayMeetings: true, launchAtLogin: true }
+            : effect === "forcePoll"
+              ? { showTomorrowMeetings: false, launchAtLogin: true }
+              : { openBeforeMinutes: 5, launchAtLogin: true };
+
+        // When the handler runs the effects after persistence.
+        const result = await setHandler(popover)(authorizedEvent, partial);
+
+        // Then acknowledgement and the remaining independent deliveries survive.
+        expect(result).toEqual(updated);
+        expect(report).toHaveBeenCalledWith(expect.stringContaining("SETTINGS_SET"), error);
+        expect(mockSyncAutoLaunch).toHaveBeenCalledWith(true);
+        expect(popover.webContents.send).toHaveBeenCalledOnce();
+        expect(settings.webContents.send).toHaveBeenCalledOnce();
+        expect(mockGetSettings).not.toHaveBeenCalled();
+      },
+    );
+
+    it("reports rejected forcePoll without rejecting the committed acknowledgement", async () => {
+      // Given an asynchronous refresh failure.
+      const error = new Error("refresh failed");
+      mockForcePoll.mockRejectedValue(error);
+      const report = vi.spyOn(console, "error").mockImplementation(() => undefined);
+      const popover = liveWindow();
+      const settings = liveWindow();
+      mockGetSettingsWindow.mockReturnValue(settings);
+      const updated = { ...DEFAULT_SETTINGS, showTomorrowMeetings: false, launchAtLogin: true };
+      mockUpdateSettings.mockResolvedValue(updated);
+
+      // When the committed update starts its refresh.
+      const result = await setHandler(popover)(authorizedEvent, {
+        showTomorrowMeetings: false,
+        launchAtLogin: true,
+      });
+
+      // Then the rejection is handled and independent deliveries still run.
+      expect(result).toEqual(updated);
+      expect(report).toHaveBeenCalledWith(expect.stringContaining("SETTINGS_SET"), error);
+      expect(mockSyncAutoLaunch).toHaveBeenCalledWith(true);
+      expect(popover.webContents.send).toHaveBeenCalledOnce();
+      expect(settings.webContents.send).toHaveBeenCalledOnce();
+    });
+
+    it.each(["restart", "tomorrow"])(
+      "preserves %s precedence over lower-priority effects",
+      async (priority) => {
+        // Given overlapping effect keys.
+        const partial = {
+          showTomorrowMeetings: false,
+          showCompletedTodayMeetings: true,
+          launchAtLogin: true,
+          ...(priority === "restart" ? { openBeforeMinutes: 5 } : {}),
+        };
+        // When one save commits.
+        await setHandler(liveWindow())(authorizedEvent, partial);
+        // Then only the highest-priority scheduler/display effect runs, plus login sync.
+        expect(mockRestartScheduler).toHaveBeenCalledTimes(priority === "restart" ? 1 : 0);
+        expect(mockForcePoll).toHaveBeenCalledTimes(priority === "tomorrow" ? 1 : 0);
+        if (priority === "tomorrow") expect(mockForcePoll).toHaveBeenCalledWith({ reason: "user" });
+        expect(mockForceTrayMenuRefresh).not.toHaveBeenCalled();
+        expect(mockSyncAutoLaunch).toHaveBeenCalledWith(true);
+      },
+    );
+
+    it.each([
+      "sameWindow",
+      "sameContents",
+      "destroyedPopover",
+      "destroyedPopoverContents",
+      "destroyedSettings",
+      "destroyedSettingsContents",
+    ])("pushes at most once per distinct live target when %s", async (target) => {
+      // Given cached targets with identity/liveness variations.
+      const popover = liveWindow();
+      const settings = target === "sameWindow" ? popover : liveWindow();
+      if (target === "sameContents") settings.webContents = popover.webContents;
+      if (target === "destroyedPopover") popover.isDestroyed.mockReturnValue(true);
+      if (target === "destroyedPopoverContents")
+        popover.webContents.isDestroyed.mockReturnValue(true);
+      if (target === "destroyedSettings") settings.isDestroyed.mockReturnValue(true);
+      if (target === "destroyedSettingsContents")
+        settings.webContents.isDestroyed.mockReturnValue(true);
+      mockGetSettingsWindow.mockReturnValue(settings);
+      // When a save commits.
+      const result = await setHandler(popover)(authorizedEvent, { launchAtLogin: true });
+      // Then only distinct live targets receive the committed push.
+      expect(result).toEqual(DEFAULT_SETTINGS);
+      expect(popover.webContents.send).toHaveBeenCalledTimes(
+        target.startsWith("destroyedPopover") ? 0 : 1,
+      );
+      expect(settings.webContents.send).toHaveBeenCalledTimes(
+        target.startsWith("destroyedSettings") ? 0 : 1,
+      );
+    });
+
     it("restarts scheduler for quiet hours and auto-open timing keys", async () => {
       const mockWin = {
         isDestroyed: vi.fn(() => false),
