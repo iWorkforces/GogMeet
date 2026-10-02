@@ -46,13 +46,16 @@ export interface IpcChannelMap {
     response: Result<void, string>;
   };
   [IPC_CHANNELS.APP_JOIN_MEETING]: {
-    request: { id: EventId };
+    request: { id: EventId; alert?: { epoch: number } };
     response: Result<void, string>;
   };
   [IPC_CHANNELS.APP_GET_VERSION]: { request: void; response: string };
   [IPC_CHANNELS.SETTINGS_GET]: { request: void; response: AppSettings };
   [IPC_CHANNELS.SETTINGS_SET]: { request: Partial<AppSettings>; response: AppSettings };
-  [IPC_CHANNELS.ALERT_DISMISSED]: { request: { id: EventId }; response: void };
+  [IPC_CHANNELS.ALERT_DISMISSED]: {
+    request: { id: EventId; epoch: number; phase: "begin" | "finish" };
+    response: void;
+  };
 }
 
 /** Type-safe IPC request/response derived from the channel map */
@@ -63,7 +66,7 @@ export type IpcResponse<K extends keyof IpcChannelMap> = IpcChannelMap[K]["respo
 
 /** Push channel payload type map for type-safe webContents.send */
 export interface PushChannelMap {
-  [IPC_CHANNELS.ALERT_SHOW]: AlertPayload;
+  [IPC_CHANNELS.ALERT_SHOW]: { epoch: number; payload: AlertPayload };
   [IPC_CHANNELS.SETTINGS_CHANGED]: AppSettings;
   [IPC_CHANNELS.CALENDAR_RESULT_UPDATED]: CalendarPublication;
 }

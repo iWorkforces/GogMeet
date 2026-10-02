@@ -14,6 +14,7 @@ import {
 } from "../../domain/services/truncate-middle.js";
 
 import type { AppState } from "../../shared/app-state.js";
+import type { CalendarProvenance } from "../lib/apply-events-push.js";
 
 /** Visible title: middle-truncate then escape. Full title stays on tooltip/aria. */
 function displayMeetingTitle(title: string): string {
@@ -64,7 +65,31 @@ function renderCompletedHistoryRow(event: MeetingEvent): string {
           `;
 }
 
-export function renderBody(s: AppState, settings: AppSettings): string {
+export function renderBody(
+  s: AppState,
+  settings: AppSettings,
+  provenance: CalendarProvenance | null,
+): string {
+  let calendarStatus: string;
+  switch (provenance?.source) {
+    case "live":
+      switch (provenance.completeness) {
+        case "complete":
+          calendarStatus = "";
+          break;
+        case "partial":
+          calendarStatus = "Calendar data is incomplete. Automatic opening and alerts are paused.";
+          break;
+      }
+      break;
+    case "offline-cache":
+      calendarStatus =
+        "Showing saved calendar data while offline. Automatic opening and alerts are paused.";
+      break;
+    case undefined:
+      calendarStatus = "";
+      break;
+  }
   switch (s.type) {
     case "loading":
       return `
@@ -91,7 +116,7 @@ export function renderBody(s: AppState, settings: AppSettings): string {
         <div class="state-screen">
           <div class="state-icon">☕</div>
           <p class="state-title">No upcoming meetings</p>
-          <p class="state-desc">${settings.showTomorrowMeetings ? "No calendar events found for today or tomorrow." : "No calendar events found for today."}</p>
+          <p class="state-desc">${calendarStatus || (settings.showTomorrowMeetings ? "No calendar events found for today or tomorrow." : "No calendar events found for today.")}</p>
         </div>
       `;
 
@@ -118,11 +143,17 @@ export function renderBody(s: AppState, settings: AppSettings): string {
       const sectionHeader = hasTomorrowEvents ? "Today & Tomorrow" : "Today";
 
       const parts: string[] = [];
+      if (calendarStatus) parts.push(`<p class="state-desc calendar-notice">${calendarStatus}</p>`);
       if (upcoming.length > 0) {
         parts.push(`<p class="section-header">${sectionHeader}</p>`);
         upcoming.forEach((event, i) => {
           const rel = formatRelativeTime(event, now);
-          const autoJoin = !event.isAllDay && !!event.meetUrl;
+          const autoJoin =
+            settings.autoOpenEnabled &&
+            provenance?.source === "live" &&
+            provenance.completeness === "complete" &&
+            !event.isAllDay &&
+            !!event.meetUrl;
           const fullTitle = escapeHtml(event.title);
           parts.push(`
             <div class="meeting-item">

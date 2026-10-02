@@ -4,6 +4,7 @@ import { eventListSignature } from "../../domain/services/event-signature.js";
 import { filterUpcomingMeetings } from "../../domain/services/meeting-time.js";
 import {
   isCalendarAutomationEligible,
+  isCalendarLiveOk,
   isCalendarOk,
 } from "../../domain/entities/calendar-result.js";
 import type { CalendarPublication } from "../../domain/entities/calendar-publication.js";
@@ -75,7 +76,12 @@ function publishPublicationToUi(
   }
   if (state.win && !state.win.isDestroyed()) {
     const contentSignature = isCalendarOk(publication.result)
-      ? eventListSignature(events)
+      ? JSON.stringify([
+          eventListSignature(events),
+          publication.result.source,
+          isCalendarLiveOk(publication.result) ? publication.result.completeness : null,
+          publication.result.observedAt,
+        ])
       : `err:${publication.publicationGeneration}`;
     const displaySignature = isCalendarOk(publication.result)
       ? displayEventsSignature(events, nowMs)

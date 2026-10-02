@@ -1,15 +1,16 @@
 import { bench, describe } from "vitest";
 import { renderBody } from "../../src/renderer/rendering/body.js";
+import type { CalendarProvenance } from "../../src/renderer/lib/apply-events-push.js";
 import type { AppState } from "../../src/shared/app-state.js";
 import { DEFAULT_SETTINGS } from "../../src/domain/entities/settings.js";
-import {
-  asTestEventId,
-  asTestIsoUtc,
-  createMockEvent,
-  isoFromNow,
-} from "../helpers/test-utils.js";
+import { asTestEventId, asTestIsoUtc, createMockEvent, isoFromNow } from "../helpers/test-utils.js";
 
 const EVENT_COUNT = 20;
+const provenance: CalendarProvenance = {
+  source: "live",
+  completeness: "complete",
+  observedAt: Date.now(),
+};
 
 const state: AppState = {
   type: "has-events",
@@ -26,6 +27,6 @@ const state: AppState = {
 
 describe("renderer body benchmark", () => {
   bench("renderBody/20 events", () => {
-    renderBody(state, DEFAULT_SETTINGS);
+    renderBody(state, DEFAULT_SETTINGS, provenance);
   });
 });

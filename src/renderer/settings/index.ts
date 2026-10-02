@@ -39,6 +39,8 @@ let pendingSave: {
   }>;
 } | null = null;
 let isCalendarBusy = false;
+/** An edit owns the UI even if its save finishes before an older refresh resumes. */
+let settingsRevision = 0;
 let saveIndicatorTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 const ALERT_LEAD_OPTIONS = [0, 15, 30, 60, 120, 180, 300] as const;
@@ -463,6 +465,7 @@ function setupCalendarAccountListeners(): void {
   connectBtn?.addEventListener("click", () => {
     void (async () => {
       if (isCalendarBusy) return;
+      settingsRevision++;
       isCalendarBusy = true;
       render();
       try {
@@ -482,6 +485,7 @@ function setupCalendarAccountListeners(): void {
   disconnectBtn?.addEventListener("click", () => {
     void (async () => {
       if (isCalendarBusy) return;
+      settingsRevision++;
       isCalendarBusy = true;
       render();
       try {
@@ -643,6 +647,7 @@ async function saveSettings(
   indicatorId: string = "save-indicator",
   forceRerender = false,
 ): Promise<boolean> {
+  settingsRevision++;
   if (isSaving) {
     return new Promise<boolean>((resolve) => {
       if (pendingSave) {
@@ -729,22 +734,29 @@ async function saveSettings(
  */
 async function refreshFromMain(): Promise<void> {
   if (isSaving || isCalendarBusy) return;
+  const revision = ++settingsRevision;
+  let nextSettings = settings;
   try {
     const next = await window.api.settings.get();
     if (next && typeof next === "object") {
-      settings = next;
+      nextSettings = next;
     }
   } catch {
     // keep last good settings
   }
+  if (revision !== settingsRevision || isSaving || isCalendarBusy) return;
+  let nextCalendarUi = calendarUi;
   try {
     const ui = await window.api.calendar.getUiState();
     if (ui && typeof ui === "object") {
-      calendarUi = ui;
+      nextCalendarUi = ui;
     }
   } catch {
     // keep last good calendar UI
   }
+  if (revision !== settingsRevision || isSaving || isCalendarBusy) return;
+  settings = nextSettings;
+  calendarUi = nextCalendarUi;
   clearSaveIndicatorTimers();
   render();
 }
@@ -760,6 +772,7 @@ function wireLifetimeListeners(): void {
   // External prefs updates (and fan-out from SETTINGS_SET while this window is open).
   window.api.settings.onChanged((next) => {
     if (isSaving) return;
+    settingsRevision++;
     settings = next;
     clearSaveIndicatorTimers();
     render();

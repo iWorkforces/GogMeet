@@ -1,4 +1,9 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { asTestEventId, asTestIsoUtc } from "../helpers/test-utils.js";
+
+afterEach(() => {
+  window.dispatchEvent(new Event("unload"));
+});
 
 /**
  * Tests for alert/index.ts
@@ -21,14 +26,14 @@ describe("alert/index.ts", () => {
     // Mock window.api before importing the module
     vi.stubGlobal("api", {
       alert: {
-        onShowAlert: vi.fn(),
+        onShowAlert: vi.fn(() => vi.fn()),
         notifyDismissed: vi.fn(),
       },
     });
 
     const module = await import("../../src/renderer/alert/index.js");
     expect(module).toBeDefined();
-});
+  });
 });
 
 describe("formatTimeRange logic", () => {
@@ -81,8 +86,7 @@ describe("alert DOM structure", () => {
   });
 
   it("escapeHtml is imported from shared module", async () => {
-    const { escapeHtml } =
-      await import("../../src/shared/utils/escape-html.js");
+    const { escapeHtml } = await import("../../src/shared/utils/escape-html.js");
     expect(typeof escapeHtml).toBe("function");
     expect(escapeHtml("<script>")).not.toContain("<script>");
   });
@@ -128,6 +132,7 @@ type AlertCallback = (data: import("../../src/shared/alert.js").AlertPayload) =>
 interface AlertHarness {
   callback: AlertCallback;
   onShowAlertMock: ReturnType<typeof vi.fn>;
+  notifyDismissed: ReturnType<typeof vi.fn>;
 }
 
 interface TrackedListener {
@@ -163,9 +168,11 @@ async function loadAlertModule(): Promise<AlertHarness> {
   document.body.innerHTML = '<div id="app"></div>';
   installListenerTracker();
 
-  const onShowAlertMock = vi.fn<(cb: AlertCallback) => void>();
+  const onShowAlertMock = vi.fn<(cb: AlertCallback) => () => void>(() => vi.fn());
+  const notifyDismissed = vi.fn();
   vi.stubGlobal("api", {
-    alert: { onShowAlert: onShowAlertMock, notifyDismissed: vi.fn() },
+    alert: { onShowAlert: onShowAlertMock, notifyDismissed },
+    app: { joinMeeting: vi.fn().mockResolvedValue({ ok: true, value: undefined }) },
   });
 
   await import("../../src/renderer/alert/index.js");
@@ -176,24 +183,22 @@ async function loadAlertModule(): Promise<AlertHarness> {
   if (!firstCall || typeof firstCall[0] !== "function") {
     throw new Error("alert module did not register onShowAlert callback");
   }
-  return { callback: firstCall[0] as AlertCallback, onShowAlertMock };
+  return { callback: firstCall[0], onShowAlertMock, notifyDismissed };
 }
 
 function makeAlertPayload(
   overrides: Partial<import("../../src/shared/alert.js").AlertPayload> = {},
 ): import("../../src/shared/alert.js").AlertPayload {
-  type AP = import("../../src/shared/alert.js").AlertPayload;
-  type Brand<T, B> = T & { readonly __brand?: B };
   const base = {
-    id: "evt-1" as Brand<string, "EventId">,
+    id: asTestEventId("evt-1"),
     title: "Standup",
-    startDate: "2026-03-27T10:00:00.000Z" as Brand<string, "IsoUtc">,
-    endDate: "2026-03-27T10:30:00.000Z" as Brand<string, "IsoUtc">,
-    meetUrl: "https://meet.google.com/abc-defg-hij" as Brand<string, "MeetUrl">,
+    startDate: asTestIsoUtc("2026-03-27T10:00:00.000Z"),
+    endDate: asTestIsoUtc("2026-03-27T10:30:00.000Z"),
+    hasMeetUrl: true,
     calendarName: "Work",
     isAllDay: false,
     description: "Daily sync",
-  }.As<AP>();
+  };
   return { ...base, ...overrides };
 }
 
@@ -209,8 +214,8 @@ describe("alert: Escape key dismiss handler registration", () => {
     vi.unstubAllGlobals();
   });
 
-  it("Escape key triggers dismiss flow which calls window.close()", async () => {
-    const { callback } = await loadAlertModule();
+  it("Escape key triggers the origin-bound dismissal rather than anonymous window.close()", async () => {
+    const { callback, notifyDismissed } = await loadAlertModule();
 
     // Render a card so dismissAlert takes the animation path.
     callback(makeAlertPayload());
@@ -226,11 +231,12 @@ describe("alert: Escape key dismiss handler registration", () => {
     card?.dispatchEvent(new Event("animationend"));
     vi.useRealTimers();
 
-    expect(closeSpy).toHaveBeenCalled();
+    expect(notifyDismissed).toHaveBeenCalledExactlyOnceWith("evt-1");
+    expect(closeSpy).not.toHaveBeenCalled();
   });
 
   it("non-Escape keys do NOT trigger window.close()", async () => {
-    const { callback } = await loadAlertModule();
+    const { callback, notifyDismissed } = await loadAlertModule();
     callback(makeAlertPayload());
 
     document.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
@@ -238,22 +244,22 @@ describe("alert: Escape key dismiss handler registration", () => {
     document.dispatchEvent(new KeyboardEvent("keydown", { key: " " }));
 
     expect(closeSpy).not.toHaveBeenCalled();
+    expect(notifyDismissed).not.toHaveBeenCalled();
   });
 
-  it("data-action='dismiss' click triggers window.close() via animationend", async () => {
-    const { callback } = await loadAlertModule();
+  it("data-action='dismiss' click notifies its origin without anonymous window.close()", async () => {
+    const { callback, notifyDismissed } = await loadAlertModule();
     callback(makeAlertPayload());
 
-    const btn = document.querySelector<HTMLButtonElement>(
-      '[data-action="dismiss"]',
-    );
+    const btn = document.querySelector<HTMLButtonElement>('[data-action="dismiss"]');
     expect(btn).not.toBeNull();
     btn?.click();
 
     const card = document.querySelector(".alert-card");
     card?.dispatchEvent(new Event("animationend"));
 
-    expect(closeSpy).toHaveBeenCalled();
+    expect(notifyDismissed).toHaveBeenCalledExactlyOnceWith("evt-1");
+    expect(closeSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -312,21 +318,15 @@ describe("alert: alert:show IPC push updates DOM correctly", () => {
     const { callback } = await loadAlertModule();
     callback(makeAlertPayload({ description: "   " }));
 
-    expect(
-      document.querySelector(".alert-description-wrapper"),
-    ).toBeNull();
+    expect(document.querySelector(".alert-description-wrapper")).toBeNull();
   });
 
   it("includes description block when non-empty description provided", async () => {
     const { callback } = await loadAlertModule();
     callback(makeAlertPayload({ description: "Agenda items" }));
 
-    expect(
-      document.querySelector(".alert-description-wrapper"),
-    ).not.toBeNull();
-    expect(
-      document.querySelector(".alert-description")?.textContent,
-    ).toContain("Agenda items");
+    expect(document.querySelector(".alert-description-wrapper")).not.toBeNull();
+    expect(document.querySelector(".alert-description")?.textContent).toContain("Agenda items");
   });
 
   it("renders 'Time unavailable' for malformed ISO dates", async () => {
@@ -364,41 +364,72 @@ describe("alert: duplicate uid coalescing (rapid showAlert calls)", () => {
 
     const cards = document.querySelectorAll(".alert-card");
     expect(cards.length).toBe(1);
-    expect(document.querySelector(".alert-title")?.textContent).toBe(
-      "Standup",
-    );
+    expect(document.querySelector(".alert-title")?.textContent).toBe("Standup");
   });
 
   it("subsequent payload with new uid replaces previous content (single card)", async () => {
     const { callback } = await loadAlertModule();
 
-    callback(makeAlertPayload({ id: "evt-A" as never, title: "First" }));
+    callback(makeAlertPayload({ id: asTestEventId("evt-A"), title: "First" }));
     expect(document.querySelector(".alert-title")?.textContent).toBe("First");
 
-    callback(makeAlertPayload({ id: "evt-B" as never, title: "Second" }));
+    callback(makeAlertPayload({ id: asTestEventId("evt-B"), title: "Second" }));
     const cards = document.querySelectorAll(".alert-card");
     expect(cards.length).toBe(1);
     expect(document.querySelector(".alert-title")?.textContent).toBe("Second");
   });
 
   it("dismiss in flight: repeated dismiss triggers within same module are coalesced", async () => {
-    const { callback } = await loadAlertModule();
+    const { callback, notifyDismissed } = await loadAlertModule();
     callback(makeAlertPayload());
 
-    const card = document.querySelector(".alert-card");
-    const classListAddSpy = vi.spyOn(card!.classList, "add");
-
-    const btn = document.querySelector<HTMLButtonElement>(
-      '[data-action="dismiss"]',
-    );
+    const btn = document.querySelector<HTMLButtonElement>('[data-action="dismiss"]');
     btn?.click();
     btn?.click();
     btn?.click();
 
-    const dismissingAdds = classListAddSpy.mock.calls.filter(
-      (c) => c[0] === "alert-dismissing",
-    );
-    expect(dismissingAdds.length).toBe(1);
+    expect(notifyDismissed).toHaveBeenCalledExactlyOnceWith("evt-1");
   });
 
+  it("resets dismissal on every delivery including the same ID", async () => {
+    // Given an already dismissed card in one renderer context.
+    const { callback, notifyDismissed } = await loadAlertModule();
+    callback(makeAlertPayload());
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    callback(makeAlertPayload({ title: "Replacement" }));
+    // When the new presentation is explicitly dismissed.
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    // Then each delivery has an independent dismissal.
+    expect(notifyDismissed.mock.calls).toEqual([["evt-1"], ["evt-1"]]);
+  });
+
+  it("makes a retained old keyboard listener inert after replacement", async () => {
+    // Given a retained originating key action.
+    const { callback, notifyDismissed } = await loadAlertModule();
+    callback(makeAlertPayload());
+    const keyListener = trackedDocListeners.find(({ type }) => type === "keydown")?.listener;
+    if (keyListener === undefined) throw new Error("Missing keyboard action");
+    callback(makeAlertPayload({ title: "Replacement" }));
+    // When the old key action is invoked after replacement.
+    const event = new KeyboardEvent("keydown", { key: "Escape" });
+    if (typeof keyListener === "function") keyListener.call(document, event);
+    else keyListener.handleEvent(event);
+    // Then it cannot dismiss the replacement.
+    expect(notifyDismissed).not.toHaveBeenCalled();
+    document.dispatchEvent(event);
+    expect(notifyDismissed).toHaveBeenCalledExactlyOnceWith("evt-1");
+  });
+
+  it("removes current keyboard and click actions on unload", async () => {
+    // Given a current presentation and its captured button.
+    const { callback, notifyDismissed } = await loadAlertModule();
+    callback(makeAlertPayload());
+    const button = document.querySelector<HTMLButtonElement>('[data-action="dismiss"]');
+    // When the presentation context unloads.
+    window.dispatchEvent(new Event("unload"));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    button?.click();
+    // Then neither action survives teardown.
+    expect(notifyDismissed).not.toHaveBeenCalled();
+  });
 });

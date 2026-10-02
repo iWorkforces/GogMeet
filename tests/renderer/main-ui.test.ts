@@ -2,10 +2,40 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Api } from "../../src/preload/index.js";
 import type { CalendarPermission } from "../../src/domain/entities/calendar-result.js";
 import type { CalendarResult } from "../../src/domain/entities/calendar-result.js";
+import { calendarLiveOk, calendarOfflineOk } from "../../src/domain/entities/calendar-result.js";
+import type { CalendarPublication } from "../../src/domain/entities/calendar-publication.js";
 import type { MeetingEvent } from "../../src/domain/entities/meeting-event.js";
 import { CALENDAR_LIMITED_COPY } from "../../src/domain/entities/calendar-ui-state.js";
 import { truncateMiddle } from "../../src/domain/services/truncate-middle.js";
-import { createMockEvent, createMockSettings } from "../helpers/test-utils.js";
+import { createMockEvent, createMockSettings, isoFromNow } from "../helpers/test-utils.js";
+
+const documentListeners: {
+  readonly type: string;
+  readonly listener: EventListenerOrEventListenerObject;
+  readonly options: boolean | AddEventListenerOptions | undefined;
+}[] = [];
+let originalApiDescriptor: PropertyDescriptor | undefined;
+
+beforeEach(() => {
+  originalApiDescriptor = Object.getOwnPropertyDescriptor(window, "api");
+  const add = document.addEventListener.bind(document);
+  vi.spyOn(document, "addEventListener").mockImplementation((type, listener, options) => {
+    documentListeners.push({ type, listener, options });
+    add(type, listener, options);
+  });
+});
+
+afterEach(() => {
+  for (const { type, listener, options } of documentListeners.splice(0)) {
+    document.removeEventListener(type, listener, options);
+  }
+  vi.clearAllTimers();
+  vi.useRealTimers();
+  document.body.replaceChildren();
+  if (originalApiDescriptor === undefined) Reflect.deleteProperty(window, "api");
+  else Object.defineProperty(window, "api", originalApiDescriptor);
+  vi.restoreAllMocks();
+});
 
 /** Visible popover title (middle-truncated) for textContent assertions. */
 function displayedTitle(title: string): string {
@@ -26,7 +56,6 @@ function displayedTitle(title: string): string {
 describe("renderer/index.ts", () => {
   beforeEach(() => {
     document.body.innerHTML = '<div id="app"></div>';
-    vi.restoreAllMocks();
   });
 
   it("module can be imported without errors", async () => {
@@ -37,9 +66,16 @@ describe("renderer/index.ts", () => {
 
 const RENDERER_TEST_NOW = new Date(2026, 5, 15, 12, 0, 0).getTime();
 
-async function startRenderer(events: MeetingEvent[], settings = createMockSettings()) {
+async function startRenderer(
+  events: MeetingEvent[],
+  settings = createMockSettings(),
+  preflight?: {
+    readonly permission?: Promise<CalendarPermission>;
+    readonly settings?: Promise<ReturnType<typeof createMockSettings>>;
+  },
+) {
   let nextGen = 1;
-  const getEvents = vi.fn().mockImplementation(async () => ({
+  const getEvents = vi.fn<Api["calendar"]["getEvents"]>().mockImplementation(async () => ({
     publicationGeneration: nextGen++,
     result: {
       kind: "ok" as const,
@@ -55,7 +91,7 @@ async function startRenderer(events: MeetingEvent[], settings = createMockSettin
     settingsChanged: ((settings: ReturnType<typeof createMockSettings>) => void) | null;
   } = { resultUpdated: null, settingsChanged: null };
 
-  const settingsGet = vi.fn(() => Promise.resolve(settings));
+  const settingsGet = vi.fn(() => preflight?.settings ?? Promise.resolve(settings));
   const settingsSet = vi.fn((partial: Parameters<Api["settings"]["set"]>[0]) =>
     Promise.resolve({ ...settings, ...partial }),
   );
@@ -65,7 +101,9 @@ async function startRenderer(events: MeetingEvent[], settings = createMockSettin
     calendar: {
       getEvents,
       requestPermission: vi.fn<() => Promise<CalendarPermission>>().mockResolvedValue("granted"),
-      getPermissionStatus: vi.fn<() => Promise<CalendarPermission>>().mockResolvedValue("granted"),
+      getPermissionStatus: vi.fn(
+        () => preflight?.permission ?? Promise.resolve("granted" as const),
+      ),
       disconnect: vi.fn().mockResolvedValue(undefined),
       getUiState: vi.fn().mockResolvedValue({
         permission: "granted",
@@ -113,9 +151,12 @@ async function startRenderer(events: MeetingEvent[], settings = createMockSettin
   if (typeof domContentLoadedListener !== "function") {
     throw new Error("Renderer entrypoint did not register a DOMContentLoaded listener");
   }
-  domContentLoadedListener(new Event("DOMContentLoaded"));
+  const initialized = Promise.resolve(domContentLoadedListener(new Event("DOMContentLoaded")));
 
-  await vi.waitFor(() => expect(getEvents).toHaveBeenCalledOnce());
+  if (preflight === undefined) {
+    await initialized;
+    expect(getEvents).toHaveBeenCalledOnce();
+  }
   if (callbacks.resultUpdated === null || callbacks.settingsChanged === null) {
     throw new Error("Renderer entrypoint did not register update callbacks");
   }
@@ -129,8 +170,356 @@ async function startRenderer(events: MeetingEvent[], settings = createMockSettin
     settingsGet,
     settingsSet,
     joinMeeting,
+    initialized,
   };
 }
+
+function clickRefresh(): void {
+  const button = document.querySelector<HTMLButtonElement>("[data-action='refresh']");
+  if (button === null) throw new Error("Renderer did not render the refresh control");
+  button.click();
+}
+
+function footerLabel(): string | null | undefined {
+  return document.querySelector(".footer-refresh-label")?.textContent;
+}
+
+describe("renderer publication provenance and request ordering", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(RENDERER_TEST_NOW);
+    document.body.innerHTML = '<div id="app"></div>';
+  });
+
+  it.each(["denied", "failure"] as const)(
+    "ignores an obsolete initial permission %s after accepting a publication",
+    async (completion) => {
+      // Given: permission preflight remains pending on this renderer instance.
+      const permission = Promise.withResolvers<CalendarPermission>();
+      const renderer = await startRenderer([], createMockSettings(), {
+        permission: permission.promise,
+      });
+      renderer.resultUpdatedCallback({
+        publicationGeneration: 2,
+        result: calendarLiveOk(
+          [createMockEvent({ title: "Preflight accepted" })],
+          "complete",
+          RENDERER_TEST_NOW - 4 * 60_000,
+        ),
+      });
+
+      // When: obsolete permission preflight finishes after accepted calendar data.
+      if (completion === "denied") permission.resolve("denied");
+      else permission.reject(new Error("Obsolete permission check"));
+      await renderer.initialized;
+
+      // Then: neither a denied screen nor a transport error overwrites the success.
+      expect(document.querySelector(".meeting-title")?.textContent).toBe("Preflight accepted");
+      expect(footerLabel()).toBe("Updated 4 min ago");
+      expect(renderer.getEvents).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps accepted data and pushed settings when an obsolete initial settings fetch completes", async () => {
+    // Given: initial settings are pending while a publication and a local toggle are accepted.
+    const settings = Promise.withResolvers<ReturnType<typeof createMockSettings>>();
+    const renderer = await startRenderer([], createMockSettings(), { settings: settings.promise });
+    renderer.resultUpdatedCallback({
+      publicationGeneration: 2,
+      result: calendarLiveOk(
+        [createMockEvent({ title: "Current settings meeting" })],
+        "complete",
+        RENDERER_TEST_NOW,
+      ),
+    });
+    renderer.settingsChangedCallback(createMockSettings({ showCompletedTodayMeetings: true }));
+
+    // When: old preflight settings finally resolve.
+    settings.resolve(createMockSettings({ autoOpenEnabled: false }));
+    await renderer.initialized;
+
+    // Then: the current accepted row/settings are not overwritten or refetched.
+    expect(document.querySelector(".meeting-title")?.textContent).toBe("Current settings meeting");
+    expect(document.querySelector(".badge-auto")).not.toBeNull();
+    expect(renderer.getEvents).not.toHaveBeenCalled();
+  });
+
+  it("filters current accepted rows after a tomorrow toggle even when its GET returns the same generation", async () => {
+    // Given: an accepted complete publication includes today and tomorrow.
+    const today = createMockEvent({ title: "Today retained" });
+    const tomorrow = createMockEvent({
+      title: "Tomorrow retained",
+      startDate: isoFromNow(24 * 60),
+    });
+    const renderer = await startRenderer([today, tomorrow]);
+    renderer.getEvents.mockResolvedValueOnce({
+      publicationGeneration: 1,
+      result: calendarLiveOk([today, tomorrow], "complete", RENDERER_TEST_NOW + 60_000),
+    });
+
+    // When: the pushed setting hides tomorrow and the coordinated GET finishes.
+    renderer.settingsChangedCallback(createMockSettings({ showTomorrowMeetings: false }));
+    await vi.advanceTimersByTimeAsync(0);
+
+    // Then: settings filter the accepted snapshot, without adopting equal-generation provenance.
+    expect(document.body.textContent).toContain("Today retained");
+    expect(document.body.textContent).not.toContain("Tomorrow retained");
+    expect(footerLabel()).toBe("Updated just now");
+    expect(renderer.getEvents).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the accepted snapshot when an equal-generation tick crosses local midnight", async () => {
+    // Given: tomorrow-only data is retained but hidden by today's filter.
+    const tomorrow = createMockEvent({
+      title: "New day meeting",
+      startDate: isoFromNow(24 * 60),
+      endDate: isoFromNow(24 * 60 + 30),
+    });
+    const settings = createMockSettings({ showTomorrowMeetings: false });
+    const renderer = await startRenderer([tomorrow], settings);
+    expect(document.querySelector(".meeting-title")).toBeNull();
+    const nextDay = new Date(RENDERER_TEST_NOW);
+    nextDay.setDate(nextDay.getDate() + 1);
+    nextDay.setHours(0, 0, 0, 0);
+    vi.setSystemTime(nextDay);
+
+    // When: an equal-generation display push carries no new observation.
+    renderer.resultUpdatedCallback({
+      publicationGeneration: 1,
+      result: calendarLiveOk([], "partial", nextDay.getTime()),
+    });
+
+    // Then: the canonical rows become today's rows, not the tick's payload.
+    expect(document.querySelector(".meeting-title")?.textContent).toBe("New day meeting");
+    expect(document.querySelector(".badge-auto")).not.toBeNull();
+    expect(footerLabel()).toBe("Updated 720 min ago");
+    expect(renderer.getEvents).toHaveBeenCalledOnce();
+  });
+
+  it.each(["complete", "partial", "offline"] as const)(
+    "retains %s provenance when rows are unchanged",
+    async (kind) => {
+      // Given: the entrypoint already displays these exact rows.
+      const events = [createMockEvent({ title: "Retained meeting" })];
+      const renderer = await startRenderer(events);
+      await renderer.initialized;
+      const observedAt = RENDERER_TEST_NOW - 4 * 60_000;
+
+      // When: only publication provenance changes.
+      renderer.resultUpdatedCallback({
+        publicationGeneration: 2,
+        result:
+          kind === "offline"
+            ? calendarOfflineOk(events, observedAt, RENDERER_TEST_NOW - 60_000)
+            : calendarLiveOk(events, kind, observedAt),
+      });
+
+      // Then: observation age and automation reflect the accepted provenance, not arrival.
+      expect(footerLabel()).toBe("Updated 4 min ago");
+      expect(document.querySelector(".meeting-title")?.textContent).toBe("Retained meeting");
+      expect(document.querySelector(".badge-auto") !== null).toBe(kind === "complete");
+      if (kind !== "complete") {
+        expect(document.querySelector(".state-desc")?.textContent).toMatch(/paused/i);
+        const join = document.querySelector<HTMLButtonElement>("[data-action='join-meeting']");
+        if (join === null) throw new Error("Retained meeting lost manual Join");
+        join.click();
+        expect(renderer.joinMeeting).toHaveBeenCalledWith(events[0]?.id);
+      }
+    },
+  );
+
+  it.each(["partial", "offline"] as const)(
+    "explains empty %s data and paused automation",
+    async (kind) => {
+      // Given: an already empty successful list.
+      const renderer = await startRenderer([]);
+      await renderer.initialized;
+
+      // When: the empty list becomes degraded.
+      renderer.resultUpdatedCallback({
+        publicationGeneration: 2,
+        result:
+          kind === "offline"
+            ? calendarOfflineOk([], RENDERER_TEST_NOW - 7 * 60_000, RENDERER_TEST_NOW)
+            : calendarLiveOk([], "partial", RENDERER_TEST_NOW - 7 * 60_000),
+      });
+
+      // Then: even without rows, status is honest and the observation remains old.
+      expect(document.querySelector(".state-desc")?.textContent).toMatch(
+        kind === "offline" ? /offline/i : /incomplete/i,
+      );
+      expect(document.querySelector(".state-desc")?.textContent).toMatch(/paused/i);
+      expect(footerLabel()).toBe("Updated 7 min ago");
+      expect(document.querySelector(".badge-auto")).toBeNull();
+    },
+  );
+
+  it.each(["publication", "transport"] as const)(
+    "does not freshen the observation after a %s error",
+    async (kind) => {
+      // Given: an accepted observation that has aged.
+      const renderer = await startRenderer([createMockEvent()]);
+      await renderer.initialized;
+      vi.setSystemTime(RENDERER_TEST_NOW + 3 * 60_000);
+
+      // When: the current refresh fails.
+      if (kind === "publication") {
+        renderer.resultUpdatedCallback({
+          publicationGeneration: 2,
+          result: { kind: "err", error: "Current refresh failed", code: "runtime" },
+        });
+      } else {
+        renderer.getEvents.mockRejectedValueOnce(new Error("Current refresh failed"));
+        clickRefresh();
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      // Then: failure is visible but does not become a fresh observation.
+      expect(document.body.textContent).toContain("Current refresh failed");
+      expect(footerLabel()).toBe("Updated 3 min ago");
+    },
+  );
+
+  it.each(["lower-success", "lower-error", "transport", "equal-success", "equal-error"] as const)(
+    "keeps the accepted pushed state after an obsolete %s GET completion",
+    async (completion) => {
+      // Given: a GET remains pending on this same renderer instance.
+      const renderer = await startRenderer([createMockEvent({ title: "Before request" })]);
+      await renderer.initialized;
+      const pending = Promise.withResolvers<CalendarPublication>();
+      renderer.getEvents.mockImplementationOnce(() => pending.promise);
+      clickRefresh();
+      await vi.advanceTimersByTimeAsync(0);
+      const retained = createMockEvent({ title: "New accepted meeting" });
+      renderer.resultUpdatedCallback({
+        publicationGeneration: 2,
+        result: calendarLiveOk([retained], "complete", RENDERER_TEST_NOW - 3 * 60_000),
+      });
+
+      // When: the obsolete request settles after that newer success.
+      if (completion === "transport") pending.reject(new Error("Obsolete transport error"));
+      else
+        pending.resolve({
+          publicationGeneration: completion.startsWith("equal") ? 2 : 1,
+          result: completion.endsWith("error")
+            ? { kind: "err", error: "Obsolete calendar error", code: "runtime" }
+            : calendarLiveOk([retained], "partial", RENDERER_TEST_NOW + 2 * 60_000),
+        });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Then: no older captured list/error/provenance replaces accepted state.
+      expect(document.querySelector(".meeting-title")?.textContent).toBe("New accepted meeting");
+      expect(document.body.textContent).not.toContain("Before request");
+      expect(document.body.textContent).not.toContain("Obsolete");
+      expect(document.querySelector(".badge-auto")).not.toBeNull();
+      expect(footerLabel()).toBe("Updated 3 min ago");
+      expect(renderer.getEvents).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it.each(["success", "failure"] as const)(
+    "ignores an earlier request's equal-generation %s after a newer GET succeeds",
+    async (completion) => {
+      // Given: two GETs overlap without resetting this renderer instance.
+      const renderer = await startRenderer([createMockEvent({ title: "Initial meeting" })]);
+      await renderer.initialized;
+      const earlier = Promise.withResolvers<CalendarPublication>();
+      const later = Promise.withResolvers<CalendarPublication>();
+      renderer.getEvents
+        .mockImplementationOnce(() => earlier.promise)
+        .mockImplementationOnce(() => later.promise);
+      clickRefresh();
+      await vi.advanceTimersByTimeAsync(0);
+      clickRefresh();
+      await vi.advanceTimersByTimeAsync(0);
+      later.resolve({
+        publicationGeneration: 2,
+        result: calendarLiveOk(
+          [createMockEvent({ title: "Later accepted GET" })],
+          "complete",
+          RENDERER_TEST_NOW,
+        ),
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // When: the earlier request finally completes.
+      if (completion === "failure") earlier.reject(new Error("Earlier failed GET"));
+      else
+        earlier.resolve({
+          publicationGeneration: 2,
+          result: calendarLiveOk(
+            [createMockEvent({ title: "Earlier stale GET" })],
+            "complete",
+            RENDERER_TEST_NOW,
+          ),
+        });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // Then: the newer request's accepted success remains visible.
+      expect(document.querySelector(".meeting-title")?.textContent).toBe("Later accepted GET");
+      expect(document.body.textContent).not.toContain("Earlier");
+    },
+  );
+
+  it("ages clock labels on equal-generation display ticks without fetching or freshening", async () => {
+    // Given: accepted complete data has a near-future meeting.
+    const events = [createMockEvent({ title: "Display tick meeting" })];
+    const renderer = await startRenderer(events);
+    await renderer.initialized;
+    expect(document.querySelector(".meeting-time")?.textContent).toBe("In 5 min");
+
+    // When: time moves and main sends the same accepted generation.
+    vi.setSystemTime(RENDERER_TEST_NOW + 60_000);
+    renderer.resultUpdatedCallback({
+      publicationGeneration: 1,
+      result: calendarLiveOk(events, "complete", RENDERER_TEST_NOW),
+    });
+
+    // Then: rows/eligibility stay intact while only presentation advances.
+    expect(document.querySelector(".meeting-time")?.textContent).toBe("In 4 min");
+    expect(document.querySelector(".badge-auto")).not.toBeNull();
+    expect(footerLabel()).toBe("Updated 1 min ago");
+    expect(renderer.getEvents).toHaveBeenCalledOnce();
+    expect(renderer.settingsGet).toHaveBeenCalledOnce();
+    expect(renderer.joinMeeting).not.toHaveBeenCalled();
+  });
+
+  it("moves retained rows into history on an equal-generation display tick without polling", async () => {
+    // Given: local end timers have not run, but the accepted data includes both rows.
+    const ending = createMockEvent({
+      title: "Tick-ended meeting",
+      startDate: isoFromNow(-10),
+      endDate: isoFromNow(2),
+    });
+    const future = createMockEvent({
+      id: "future",
+      title: "Still upcoming",
+      startDate: isoFromNow(10),
+    });
+    const renderer = await startRenderer(
+      [ending, future],
+      createMockSettings({ showCompletedTodayMeetings: true }),
+    );
+    await renderer.initialized;
+
+    // When: a same-generation display push arrives after the first row ends.
+    vi.setSystemTime(RENDERER_TEST_NOW + 3 * 60_000);
+    renderer.resultUpdatedCallback({
+      publicationGeneration: 1,
+      result: calendarLiveOk([ending, future], "complete", RENDERER_TEST_NOW),
+    });
+
+    // Then: history and the surviving row are locally re-filtered; observation is unchanged.
+    expect(document.querySelector(".meeting-item--completed .meeting-title")?.textContent).toBe(
+      "Tick-ended meeting",
+    );
+    expect(document.body.textContent).toContain("Still upcoming");
+    expect(footerLabel()).toBe("Updated 3 min ago");
+    expect(renderer.getEvents).toHaveBeenCalledOnce();
+    expect(renderer.settingsGet).toHaveBeenCalledOnce();
+    expect(renderer.joinMeeting).not.toHaveBeenCalled();
+  });
+});
 
 describe("renderer unchanged calendar updates", () => {
   beforeEach(() => {

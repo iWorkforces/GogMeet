@@ -52,6 +52,29 @@ describe("JsonSettingsStore", () => {
     expect(loaded).toHaveProperty("ok");
   });
 
+  it("keeps the committed cache when a disk write fails and recovers on the next update", async () => {
+    // Given a committed snapshot and a directory obstructing settings.json.
+    const { createJsonSettingsStore } =
+      await import("../../src/main/infrastructure/settings/json-settings-store.js");
+    const store = createJsonSettingsStore();
+    await store.load();
+    const committed = await store.update({ openBeforeMinutes: 4 });
+    const path = join(dir, "settings.json");
+    await rm(path);
+    await mkdir(path);
+
+    // When persistence cannot write the proposed change.
+    await expect(store.update({ openBeforeMinutes: 7 })).rejects.toThrow();
+
+    // Then the prior cache survives, and a later save can commit normally.
+    expect(store.get()).toEqual(committed);
+    await rm(path, { recursive: true });
+    const recovered = await store.update({ showCompletedTodayMeetings: true });
+    expect(recovered).toEqual({ ...committed, showCompletedTodayMeetings: true });
+    const reloaded = await createJsonSettingsStore().load();
+    expect(reloaded).toEqual({ ok: true, value: recovered });
+  });
+
   it("clamps openBeforeMinutes and migrates schema v1", async () => {
     await writeFile(
       join(dir, "settings.json"),

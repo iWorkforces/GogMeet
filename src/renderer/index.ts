@@ -1,5 +1,5 @@
 import "./styles/main.css";
-import type { CalendarPermission } from "../domain/entities/calendar-result.js";
+import type { CalendarPermission, CalendarResultOk } from "../domain/entities/calendar-result.js";
 import { isCalendarOk } from "../domain/entities/calendar-result.js";
 import type { CalendarPublication } from "../domain/entities/calendar-publication.js";
 import type { AppSettings } from "../domain/entities/settings.js";
@@ -20,7 +20,7 @@ interface RendererState {
   state: AppState;
   version: string;
   settings: AppSettings;
-  lastUpdatedAt: number | null;
+  provenance: CalendarResultOk | null;
   cachedSettings: AppSettings | null;
   cachedPermission: CalendarPermission | null;
   lastHeight: number;
@@ -28,6 +28,7 @@ interface RendererState {
   lastPollTime: number;
   /** Defense-in-depth: ignore stale publications with older generations. */
   loadGeneration: number;
+  loadRequestId: number;
   /** Renderer-owned presentation timer for completed-history invalidation. */
   presentationTimer: ReturnType<typeof setTimeout> | null;
 }
@@ -36,13 +37,14 @@ const rs: RendererState = {
   state: { type: "loading" },
   version: "",
   settings: { ...DEFAULT_SETTINGS },
-  lastUpdatedAt: null,
+  provenance: null,
   cachedSettings: null,
   cachedPermission: null,
   lastHeight: 0,
   lastEventsSignature: "",
   lastPollTime: Date.now(),
-  loadGeneration: 0,
+  loadGeneration: -1,
+  loadRequestId: 0,
   presentationTimer: null,
 };
 
@@ -112,7 +114,7 @@ function armPresentationTimer(): void {
   const delay = Math.max(0, deadline - nowMs);
   rs.presentationTimer = setTimeout(() => {
     rs.presentationTimer = null;
-    // Local re-filter only — preserve lastUpdatedAt.
+    // Local re-filter only — preserve the accepted observation time.
     render();
   }, delay);
 }
@@ -126,8 +128,9 @@ function formatLastUpdated(ts: number): string {
 }
 
 function renderFooter(): string {
-  const label = rs.lastUpdatedAt === null ? "Loading…" : formatLastUpdated(rs.lastUpdatedAt);
-  const isLoading = rs.lastUpdatedAt === null;
+  const observedAt = rs.provenance?.observedAt ?? null;
+  const label = observedAt === null ? "Loading…" : formatLastUpdated(observedAt);
+  const isLoading = observedAt === null;
   const icon = isLoading ? "" : '<span class="footer-refresh-icon" aria-hidden="true">↻</span>';
   return `
     <footer class="footer">
@@ -140,7 +143,15 @@ function renderFooter(): string {
   `;
 }
 
-function render() {
+function render(viewState?: AppState) {
+  if (
+    viewState === undefined &&
+    rs.provenance !== null &&
+    (rs.state.type === "has-events" || rs.state.type === "no-events")
+  ) {
+    applyResult(rs.provenance);
+  }
+  const state = viewState ?? rs.state;
   try {
     const app = document.getElementById("app");
     if (!app) {
@@ -149,7 +160,7 @@ function render() {
     }
 
     app.innerHTML = `<div role="dialog" aria-label="GogMeet meetings" aria-live="polite">
-        <div class="body">${renderBody(rs.state, rs.settings)}</div>
+        <div class="body">${renderBody(state, rs.settings, rs.provenance)}</div>
         ${renderFooter()}
       </div>`;
 
@@ -169,10 +180,13 @@ function render() {
 }
 
 async function grantAccess() {
+  const requestId = ++rs.loadRequestId;
+  const generationAtStart = rs.loadGeneration;
   rs.state = { type: "no-permission", retrying: true };
   render();
 
   const status = await window.api.calendar.requestPermission();
+  if (requestId !== rs.loadRequestId || generationAtStart !== rs.loadGeneration) return;
   rs.cachedPermission = status;
   if (status === "granted") {
     await loadEvents();
@@ -182,8 +196,8 @@ async function grantAccess() {
   }
 }
 
-function applyPublication(publication: CalendarPublication, prevState: AppState): void {
-  if (publication.publicationGeneration < rs.loadGeneration) {
+function applyPublication(publication: CalendarPublication): void {
+  if (publication.publicationGeneration <= rs.loadGeneration) {
     return;
   }
   rs.loadGeneration = publication.publicationGeneration;
@@ -192,16 +206,19 @@ function applyPublication(publication: CalendarPublication, prevState: AppState)
     rs.state = { type: "error", message: result.error };
     return;
   }
+  applyResult(result);
+}
+
+function applyResult(result: CalendarResultOk): void {
   const applied = applyEventsPush({
     events: result.events,
+    provenance: result,
     settings: rs.settings,
-    prevState,
+    prevState: rs.state,
+    prevProvenance: rs.provenance,
     prevSignature: rs.lastEventsSignature,
   });
-  if (!applied.didChange) {
-    rs.state = applied.state;
-    return;
-  }
+  rs.provenance = result;
   rs.lastEventsSignature = applied.signature;
   rs.state = applied.state;
 }
@@ -210,9 +227,9 @@ function applyPublication(publication: CalendarPublication, prevState: AppState)
  * Single refresh path: await coordinated publication from main (no separate forcePoll).
  */
 async function loadEvents() {
-  const prevState = rs.state;
-  rs.state = { type: "loading" };
-  render();
+  const requestId = ++rs.loadRequestId;
+  const generationAtStart = rs.loadGeneration;
+  render({ type: "loading" });
 
   try {
     // Fetch settings and permission in parallel — they are independent
@@ -220,8 +237,9 @@ async function loadEvents() {
       rs.cachedSettings ?? window.api.settings.get(),
       rs.cachedPermission ?? window.api.calendar.getPermissionStatus(),
     ]);
-    rs.settings = fetchedSettings;
-    rs.cachedSettings = fetchedSettings;
+    if (requestId !== rs.loadRequestId || generationAtStart !== rs.loadGeneration) return;
+    rs.settings = rs.cachedSettings ?? fetchedSettings;
+    rs.cachedSettings = rs.settings;
     rs.cachedPermission = fetchedPermission;
 
     if (fetchedPermission === "denied" || fetchedPermission === "not-determined") {
@@ -231,15 +249,16 @@ async function loadEvents() {
     }
 
     const publication = await window.api.calendar.getEvents();
-    applyPublication(publication, prevState);
+    if (requestId !== rs.loadRequestId) return;
+    applyPublication(publication);
   } catch (err) {
+    if (requestId !== rs.loadRequestId || generationAtStart !== rs.loadGeneration) return;
     rs.state = {
       type: "error",
       message: err instanceof Error ? err.message : "Unknown error",
     };
   }
 
-  rs.lastUpdatedAt = Date.now();
   render();
 }
 
@@ -278,8 +297,8 @@ async function init() {
 
   // Main pushes full publications after polls / coordinated refreshes.
   window.api.calendar.onResultUpdated((publication: CalendarPublication) => {
-    applyPublication(publication, rs.state);
-    rs.lastUpdatedAt = Date.now();
+    if (publication.publicationGeneration < rs.loadGeneration) return;
+    applyPublication(publication);
     render();
   });
 

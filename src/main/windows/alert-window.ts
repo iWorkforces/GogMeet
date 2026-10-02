@@ -1,7 +1,8 @@
 import { IPC_CHANNELS } from "../../shared/ipc-channels.js";
 import type { AlertPayload } from "../../shared/alert.js";
 import type { MeetingEvent } from "../../domain/entities/meeting-event.js";
-import { BrowserWindow } from "electron";
+import { BrowserWindow, type WebContents } from "electron";
+import type { AlertPresentationOrigin } from "./alert-presentation.js";
 import {
   SECURE_WEB_PREFERENCES,
   getPreloadPath,
@@ -41,6 +42,8 @@ function toAlertPayload(event: MeetingEvent, autoOpenAt?: IsoUtc): AlertPayload 
 let alertWindow: BrowserWindow | null = null;
 let isAlertShowing = false;
 let activePresentation: AlertPresentation | null = null;
+let activeOrigin: AlertPresentationOrigin | null = null;
+let completionReason: "explicit" | "joined" | null = null;
 let alertReady = false;
 /** FIFO queue preserves optional autoOpenAt for stacked presentations. */
 const pendingAlerts: AlertPresentation[] = [];
@@ -86,7 +89,91 @@ function processNextAlert(): void {
 }
 
 function isCurrentPresentation(win: BrowserWindow, generation: number): boolean {
-  return !win.isDestroyed() && alertWindow === win && generation === reuseGeneration;
+  return (
+    !win.isDestroyed() &&
+    !win.webContents.isDestroyed() &&
+    alertWindow === win &&
+    generation === reuseGeneration
+  );
+}
+
+export function isAlertSender(sender: WebContents | undefined): sender is WebContents {
+  return (
+    !!sender &&
+    alertWindow !== null &&
+    !alertWindow.isDestroyed() &&
+    !sender.isDestroyed() &&
+    alertWindow.webContents === sender
+  );
+}
+
+export function captureAlertPresentation(
+  sender: WebContents,
+  identity: { readonly id: EventId; readonly epoch: number },
+): AlertPresentationOrigin | null {
+  const origin = activeOrigin;
+  return origin &&
+    isAlertSender(sender) &&
+    origin.webContents === sender &&
+    origin.id === identity.id &&
+    origin.epoch === identity.epoch &&
+    isCurrentPresentation(origin.window, origin.epoch)
+    ? origin
+    : null;
+}
+
+export function closeAlertPresentation(origin: AlertPresentationOrigin): boolean {
+  if (activeOrigin !== origin || !isCurrentPresentation(origin.window, origin.epoch)) return false;
+  // Invalidate before hide or user callbacks can reenter the state machine.
+  activeOrigin = null;
+  completionReason = null;
+  reuseGeneration += 1;
+  activePresentation = null;
+  isAlertShowing = false;
+  origin.window.hide();
+  processNextAlert();
+  return true;
+}
+
+export function authorizeAlertJoinCompletion(origin: AlertPresentationOrigin): void {
+  if (activeOrigin !== origin || !isCurrentPresentation(origin.window, origin.epoch)) return;
+  completionReason ??= "joined";
+}
+
+export function handleAlertDismissal(
+  origin: AlertPresentationOrigin,
+  phase: "begin" | "finish",
+  cancel: (id: EventId) => void,
+): void {
+  if (activeOrigin !== origin || !isCurrentPresentation(origin.window, origin.epoch)) return;
+  switch (phase) {
+    case "begin":
+      if (completionReason !== null) return;
+      completionReason = "explicit";
+      cancel(origin.id);
+      return;
+    case "finish": {
+      const reason = completionReason;
+      if (reason !== null && closeAlertPresentation(origin) && reason === "explicit")
+        origin.onDismiss();
+      return;
+    }
+  }
+}
+
+function installOrigin(
+  win: BrowserWindow,
+  generation: number,
+  presentation: AlertPresentation,
+): void {
+  activeOrigin = Object.freeze({
+    window: win,
+    webContents: win.webContents,
+    epoch: generation,
+    id: presentation.event.id,
+    onDismiss: presentation.onDismiss,
+  });
+  completionReason = null;
 }
 
 export function showAlert(
@@ -113,8 +200,7 @@ export function showAlert(
       }
       return;
     }
-    // Rescheduled: reuse the live window with the new payload (no cancel of pending open —
-    // same contract as the prior destroy/recreate path with __replacing).
+    // Rescheduling replaces presentation ownership without canceling the ID-based pending open.
     const presentation: AlertPresentation = { event, onDismiss, canShow };
     if (autoOpenAt !== undefined) presentation.autoOpenAt = autoOpenAt;
     showAlertInternal(presentation, sameStart && !alertReady);
@@ -161,11 +247,10 @@ function presentAlertPayload(
     consumePresentation(win, generation);
     return;
   }
-  typedSend(
-    win.webContents,
-    IPC_CHANNELS.ALERT_SHOW,
-    toAlertPayload(presentation.event, presentation.autoOpenAt),
-  );
+  typedSend(win.webContents, IPC_CHANNELS.ALERT_SHOW, {
+    epoch: generation,
+    payload: toAlertPayload(presentation.event, presentation.autoOpenAt),
+  });
   win.webContents
     .executeJavaScript(
       `(() => {
@@ -205,7 +290,8 @@ function presentAlertPayload(
 function consumePresentation(win: BrowserWindow, generation: number): void {
   if (!isCurrentPresentation(win, generation)) return;
   reuseGeneration += 1;
-  delete win.__alertOnDismiss;
+  activeOrigin = null;
+  completionReason = null;
   delete win.__alertUid;
   activePresentation = null;
   isAlertShowing = false;
@@ -213,7 +299,7 @@ function consumePresentation(win: BrowserWindow, generation: number): void {
 }
 
 function showAlertInternal(presentation: AlertPresentation, waitForReady = false): void {
-  const { event, onDismiss } = presentation;
+  const { event } = presentation;
   const startMs = new Date(event.startDate).getTime();
   reuseGeneration += 1;
   const generation = reuseGeneration;
@@ -222,11 +308,10 @@ function showAlertInternal(presentation: AlertPresentation, waitForReady = false
   // Prefer reusing a hidden-but-alive window (same SECURE_WEB_PREFERENCES, no recreate).
   if (alertWindow && !alertWindow.isDestroyed()) {
     const win = alertWindow;
-    win.__replacing = false;
     win.__alertUid = event.id;
     win.__alertStartMs = startMs;
     win.__alertGeneration = generation;
-    win.__alertOnDismiss = onDismiss;
+    installOrigin(win, generation, presentation);
     applyAlertAlwaysOnTop(win);
     if (waitForReady) {
       win.once("ready-to-show", () => {
@@ -273,7 +358,7 @@ function showAlertInternal(presentation: AlertPresentation, waitForReady = false
   win.__alertUid = event.id;
   win.__alertStartMs = startMs;
   win.__alertGeneration = generation;
-  win.__alertOnDismiss = onDismiss;
+  installOrigin(win, generation, presentation);
   applyAlertAlwaysOnTop(win);
 
   loadWindowContent(win, "alert");
@@ -288,27 +373,20 @@ function showAlertInternal(presentation: AlertPresentation, waitForReady = false
   win.on("close", (closeEvent) => {
     if (win.__forceDestroy) return;
     closeEvent.preventDefault();
-    // Identity + generation: ignore stale close after replacement/teardown.
-    if (!isCurrentPresentation(win, win.__alertGeneration ?? -1)) return;
-    if (!win.__replacing) {
-      win.__alertOnDismiss?.();
-    }
-    win.__replacing = false;
-    if (!win.isDestroyed()) win.hide();
-    activePresentation = null;
-    isAlertShowing = false;
-    processNextAlert();
+    // An anonymous native close cannot prove which presentation requested it.
   });
 
   win.on("closed", () => {
     // Only the current window ref may clear shared module state.
     if (alertWindow !== win) return;
+    reuseGeneration += 1;
+    activeOrigin = null;
+    completionReason = null;
+    if (queuedImmediate !== null) clearImmediate(queuedImmediate);
+    queuedImmediate = null;
+    pendingAlerts.length = 0;
     activePresentation = null;
     alertReady = false;
-    if ((win.__alertGeneration ?? -1) !== reuseGeneration) {
-      alertWindow = null;
-      return;
-    }
     alertWindow = null;
     isAlertShowing = false;
   });
@@ -321,15 +399,18 @@ export function destroyAlertWindow(): void {
     queuedImmediate = null;
   }
   reuseGeneration += 1;
-  if (alertWindow && !alertWindow.isDestroyed()) {
-    alertWindow.__forceDestroy = true;
-    alertWindow.destroy();
-  }
+  const win = alertWindow;
   alertWindow = null;
+  activeOrigin = null;
+  completionReason = null;
   activePresentation = null;
   alertReady = false;
   isAlertShowing = false;
   pendingAlerts.length = 0;
+  if (win && !win.isDestroyed()) {
+    win.__forceDestroy = true;
+    win.destroy();
+  }
 }
 
 declare module "electron" {
@@ -337,8 +418,6 @@ declare module "electron" {
     __alertUid?: EventId;
     __alertStartMs?: number;
     __alertGeneration?: number;
-    __alertOnDismiss?: () => void;
-    __replacing?: boolean;
     __forceDestroy?: boolean;
   }
 }

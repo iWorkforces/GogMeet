@@ -13,50 +13,8 @@ const DATE_OPTIONS: Intl.DateTimeFormatOptions = {
   day: "numeric",
 };
 
-let isDismissing = false;
-let currentPayload: AlertPayload | null = null;
-
-function dismissAlert(): void {
-  if (isDismissing) {
-    return;
-  }
-
-  isDismissing = true;
-
-  if (currentPayload) {
-    window.api.alert.notifyDismissed(currentPayload.id);
-  }
-
-  const card = document.querySelector<HTMLElement>(".alert-card");
-  if (!card) {
-    window.close();
-    return;
-  }
-
-  let isClosed = false;
-  const closeWindow = (): void => {
-    if (isClosed) {
-      return;
-    }
-    isClosed = true;
-    window.close();
-  };
-
-  const fallbackTimer = window.setTimeout(() => {
-    closeWindow();
-  }, 300);
-
-  card.addEventListener(
-    "animationend",
-    () => {
-      window.clearTimeout(fallbackTimer);
-      closeWindow();
-    },
-    { once: true },
-  );
-
-  card.classList.add("alert-dismissing");
-}
+let live = true;
+let disposePresentation = (): void => undefined;
 
 function formatTimeRange(startISO: string, endISO: string, isAllDay: boolean): string {
   if (isAllDay) {
@@ -135,76 +93,80 @@ function render(data: AlertPayload): void {
   }
 }
 
-async function joinFromAlert(): Promise<void> {
-  if (!currentPayload?.hasMeetUrl) return;
-  const joinBtn = document.querySelector<HTMLButtonElement>('[data-action="join"]');
-  if (joinBtn) {
+function showPresentation(data: AlertPayload): void {
+  if (!live) return;
+  disposePresentation();
+  const joinMeeting = window.api.app.joinMeeting;
+  const notifyDismissed = window.api.alert.notifyDismissed;
+  render(data);
+  const card = document.querySelector<HTMLElement>(".alert-card");
+  const joinBtn = card?.querySelector<HTMLButtonElement>('[data-action="join"]');
+  const actions = card?.querySelector(".alert-actions");
+  let active = true;
+  let dismissing = false;
+  const dismissAlert = (): void => {
+    if (!active || dismissing) return;
+    dismissing = true;
+    notifyDismissed(data.id);
+  };
+  const joinFromAlert = async (): Promise<void> => {
+    if (!active || dismissing || !data.hasMeetUrl || !joinBtn || joinBtn.disabled) return;
     joinBtn.disabled = true;
     joinBtn.textContent = "Opening…";
-  }
-  const result = await window.api.app.joinMeeting(currentPayload.id);
-  if (!result.ok) {
-    console.error("[alert] Join failed:", result.error);
-    const errorText =
-      typeof result.error === "string" && result.error.length > 0
-        ? result.error
-        : "Could not open the meeting";
-    let banner = document.getElementById("join-error");
-    if (!banner) {
-      banner = document.createElement("p");
-      banner.id = "join-error";
-      banner.setAttribute("role", "alert");
-      banner.style.cssText =
-        "margin:12px 0 0;padding:8px 12px;border-radius:8px;background:rgba(255,69,58,0.18);color:#ffb4ae;font-size:13px;line-height:1.35;";
-      const actions = document.querySelector(".alert-actions");
-      actions?.parentElement?.insertBefore(banner, actions);
+    const result = await joinMeeting(data.id);
+    if (!active || dismissing || !card?.isConnected) return;
+    switch (result.ok) {
+      case true:
+        dispose();
+        return;
+      case false: {
+        console.error("[alert] Join failed:", result.error);
+        const errorText =
+          typeof result.error === "string" && result.error.length > 0
+            ? result.error
+            : "Could not open the meeting";
+        let banner = card.querySelector<HTMLElement>("#join-error");
+        if (!banner) {
+          banner = document.createElement("p");
+          banner.id = "join-error";
+          banner.setAttribute("role", "alert");
+          banner.style.cssText =
+            "margin:12px 0 0;padding:8px 12px;border-radius:8px;background:rgba(255,69,58,0.18);color:#ffb4ae;font-size:13px;line-height:1.35;";
+          actions?.parentElement?.insertBefore(banner, actions);
+        }
+        banner.textContent = errorText.slice(0, 160);
+        joinBtn.disabled = false;
+        joinBtn.textContent = "Join Meeting";
+        return;
+      }
+      default:
+        return result satisfies never;
     }
-    banner.textContent = errorText.slice(0, 160);
-    if (joinBtn) {
-      joinBtn.disabled = false;
-      joinBtn.textContent = "Join Meeting";
-    }
-    return;
-  }
-  dismissAlert();
+  };
+  const onClick = (event: MouseEvent): void => {
+    if (!active || !isElementTarget(event.target)) return;
+    const action = event.target.closest<HTMLElement>("[data-action]")?.dataset["action"];
+    if (action === "dismiss") dismissAlert();
+    else if (action === "join") void joinFromAlert();
+  };
+  const onKeyDown = (event: KeyboardEvent): void => {
+    if (event.key === "Escape") dismissAlert();
+  };
+  const dispose = (): void => {
+    active = false;
+    card?.removeEventListener("click", onClick);
+    document.removeEventListener("keydown", onKeyDown);
+  };
+  disposePresentation = dispose;
+  card?.addEventListener("click", onClick);
+  document.addEventListener("keydown", onKeyDown);
 }
 
-function setupDelegatedEvents(): void {
-  const app = document.getElementById("app");
-  if (!app) return;
-
-  app.addEventListener("click", (event: MouseEvent) => {
-    if (!isElementTarget(event.target)) return;
-    const target = event.target.closest<HTMLElement>("[data-action]");
-
-    if (!target) {
-      return;
-    }
-
-    const action = target.dataset["action"];
-
-    if (action === "dismiss") {
-      dismissAlert();
-    } else if (action === "join") {
-      void joinFromAlert();
-    }
-  });
-}
-
-function setupKeyboardDismiss(): void {
-  document.addEventListener("keydown", (e: KeyboardEvent) => {
-    if (e.key === "Escape") {
-      dismissAlert();
-    }
-  });
-}
-
-window.api.alert.onShowAlert((data: AlertPayload) => {
-  currentPayload = data;
-  render(data);
-});
-
-document.addEventListener("DOMContentLoaded", () => {
-  setupDelegatedEvents();
-  setupKeyboardDismiss();
-});
+const unsubscribe = window.api.alert.onShowAlert(showPresentation);
+const dispose = (): void => {
+  live = false;
+  disposePresentation();
+  unsubscribe();
+  window.removeEventListener("unload", dispose);
+};
+window.addEventListener("unload", dispose);

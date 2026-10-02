@@ -1,5 +1,10 @@
 import { contextBridge, ipcRenderer } from "electron";
-import { IPC_CHANNELS, type IpcRequest, type IpcResponse } from "../shared/ipc-channels.js";
+import {
+  IPC_CHANNELS,
+  type IpcRequest,
+  type IpcResponse,
+  type PushChannelMap,
+} from "../shared/ipc-channels.js";
 import type { AlertPayload } from "../shared/alert.js";
 import type { AppSettings } from "../domain/entities/settings.js";
 import type { CalendarPublication } from "../domain/entities/calendar-publication.js";
@@ -10,9 +15,9 @@ import {
   type EventId,
   type MeetUrl,
 } from "../domain/entities/brand.js";
-import type { Result } from "../domain/entities/result.js";
 import { err } from "../domain/entities/result.js";
 import { isAllowedMeetHostname } from "../domain/policies/meet-url-allowlist.js";
+import { installMainWorldApi, type AlertSubscriber } from "./main-world-api.js";
 
 function brandMeetUrl(raw: string): MeetUrl | null {
   const branded = asMeetUrl(raw);
@@ -27,7 +32,18 @@ function brandMeetUrl(raw: string): MeetUrl | null {
   return branded.value;
 }
 
-const api = {
+function joinMeeting(
+  rawId: string,
+  epoch?: number,
+): Promise<IpcResponse<typeof IPC_CHANNELS.APP_JOIN_MEETING>> {
+  const id = asEventId(rawId);
+  if (!id.ok) return Promise.resolve(err(id.error));
+  const request: IpcRequest<typeof IPC_CHANNELS.APP_JOIN_MEETING> = { id: id.value };
+  if (epoch !== undefined) request.alert = { epoch };
+  return ipcRenderer.invoke(IPC_CHANNELS.APP_JOIN_MEETING, request);
+}
+
+const baseApi = {
   calendar: {
     getEvents: (): Promise<IpcResponse<typeof IPC_CHANNELS.CALENDAR_GET_EVENTS>> =>
       ipcRenderer.invoke(IPC_CHANNELS.CALENDAR_GET_EVENTS),
@@ -69,16 +85,13 @@ const api = {
     openExternal: (url: string): Promise<IpcResponse<typeof IPC_CHANNELS.APP_OPEN_EXTERNAL>> => {
       const branded = brandMeetUrl(url);
       if (branded === null) {
-        return Promise.resolve(err("Invalid or disallowed URL") as Result<void, string>);
+        return Promise.resolve(err("Invalid or disallowed URL"));
       }
       return ipcRenderer.invoke(IPC_CHANNELS.APP_OPEN_EXTERNAL, { url: branded });
     },
 
-    joinMeeting: (rawId: string): Promise<IpcResponse<typeof IPC_CHANNELS.APP_JOIN_MEETING>> => {
-      const id = asEventId(rawId);
-      if (!id.ok) return Promise.resolve(err(id.error));
-      return ipcRenderer.invoke(IPC_CHANNELS.APP_JOIN_MEETING, { id: id.value });
-    },
+    joinMeeting: (rawId: string): Promise<IpcResponse<typeof IPC_CHANNELS.APP_JOIN_MEETING>> =>
+      joinMeeting(rawId),
 
     getVersion: (): Promise<IpcResponse<typeof IPC_CHANNELS.APP_GET_VERSION>> =>
       ipcRenderer.invoke(IPC_CHANNELS.APP_GET_VERSION),
@@ -103,24 +116,33 @@ const api = {
       };
     },
   },
-
-  alert: {
-    onShowAlert: (callback: (data: AlertPayload) => void): (() => void) => {
-      const handler = (_event: Electron.IpcRendererEvent, data: AlertPayload): void => {
-        callback(data);
-      };
-      ipcRenderer.on(IPC_CHANNELS.ALERT_SHOW, handler);
-      return () => {
-        ipcRenderer.removeListener(IPC_CHANNELS.ALERT_SHOW, handler);
-      };
-    },
-
-    notifyDismissed: (id: EventId): void => {
-      ipcRenderer.send(IPC_CHANNELS.ALERT_DISMISSED, { id });
-    },
-  },
 };
 
-contextBridge.exposeInMainWorld("api", api);
+const subscribeAlert: AlertSubscriber = (callback) => {
+  const handler = (
+    _event: Electron.IpcRendererEvent,
+    wire: PushChannelMap[typeof IPC_CHANNELS.ALERT_SHOW],
+  ): void => {
+    const { epoch, payload } = wire;
+    const dismiss = (rawId: EventId, phase: "begin" | "finish"): void => {
+      const id = asEventId(rawId);
+      if (id.ok) ipcRenderer.send(IPC_CHANNELS.ALERT_DISMISSED, { id: id.value, epoch, phase });
+    };
+    callback(payload, {
+      join: (rawId: string) => joinMeeting(rawId, epoch),
+      begin: (id: EventId) => dismiss(id, "begin"),
+      finish: (id: EventId) => dismiss(id, "finish"),
+    });
+  };
+  ipcRenderer.on(IPC_CHANNELS.ALERT_SHOW, handler);
+  return () => ipcRenderer.removeListener(IPC_CHANNELS.ALERT_SHOW, handler);
+};
 
-export type Api = typeof api;
+contextBridge.executeInMainWorld({ func: installMainWorldApi, args: [baseApi, subscribeAlert] });
+
+export type Api = typeof baseApi & {
+  alert: {
+    onShowAlert: (callback: (data: AlertPayload) => void) => () => void;
+    notifyDismissed: (id: EventId) => void;
+  };
+};

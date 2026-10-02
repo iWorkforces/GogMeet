@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { CalendarResult } from "../../src/domain/entities/calendar-result.js";
+import { calendarLiveOk, calendarOfflineOk } from "../../src/domain/entities/calendar-result.js";
 import type { MeetingEvent } from "../../src/domain/entities/meeting-event.js";
 import type { SchedulerRuntime } from "../../src/main/scheduler/runtime.js";
 import type { SchedulerFacade } from "../../src/main/scheduler/facade.js";
@@ -600,6 +601,7 @@ describe("poll()", () => {
 describe("event list signature gating (renderer push)", () => {
   beforeEach(() => {
     vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-02T10:00:00Z"));
     resetFixture();
     refreshStateRefs();
     stateModule.state.onTrayTitleUpdate = mockTrayCallback;
@@ -612,6 +614,8 @@ describe("event list signature gating (renderer push)", () => {
   });
 
   afterEach(() => {
+    stopScheduler();
+    vi.clearAllTimers();
     resetFixture();
     refreshStateRefs();
     vi.useRealTimers();
@@ -655,6 +659,82 @@ describe("event list signature gating (renderer push)", () => {
     ["isAllDay", { isAllDay: true }],
     ["calendarName", { calendarName: "Personal" }],
   ];
+
+  it.each([
+    ["complete-to-partial", false],
+    ["partial-to-offline", false],
+    ["observedAt", false],
+    ["complete-to-partial", true],
+    ["partial-to-offline", true],
+    ["observedAt", true],
+  ] as const)("re-pushes provenance %s when empty=%s", async (change, empty) => {
+    // Given: an accepted observation with retained rows (or an empty list).
+    const events = empty
+      ? []
+      : [
+          createMockEvent({
+            startDate: asTestIsoUtc(isoFromNow(10)),
+            endDate: asTestIsoUtc(isoFromNow(40)),
+          }),
+        ];
+    const observedAt = Date.now() - 60_000;
+    const initial = calendarLiveOk(
+      events,
+      change === "partial-to-offline" ? "partial" : "complete",
+      observedAt,
+    );
+    const result =
+      change === "partial-to-offline"
+        ? calendarOfflineOk(events, observedAt, observedAt + 30_000)
+        : calendarLiveOk(
+            events,
+            change === "complete-to-partial" ? "partial" : "complete",
+            change === "observedAt" ? observedAt + 1000 : observedAt,
+          );
+    const send = vi.fn();
+    runtime.state.win = {
+      isDestroyed: () => false,
+      webContents: { send, isDestroyed: () => false },
+    }.As<NonNullable<SchedulerRuntime["state"]["win"]>>();
+    refreshCalendarPublication.mockResolvedValue({ publicationGeneration: 1, result: initial });
+    await poll();
+    send.mockClear();
+    const publication = { publicationGeneration: 2, result };
+    refreshCalendarPublication.mockResolvedValue(publication);
+
+    // When: only provenance changes; rows and display membership do not.
+    await poll();
+
+    // Then: the renderer receives the new observation, not just changed rows.
+    expect(send).toHaveBeenCalledExactlyOnceWith("calendar:result-updated", publication);
+  });
+
+  it.each(["complete", "partial", "offline-cache"] as const)(
+    "deduplicates identical empty %s observations despite a newer generation",
+    async (provenance) => {
+      // Given: the same observation is published in successive envelopes.
+      const observedAt = Date.now() - 60_000;
+      const result =
+        provenance === "offline-cache"
+          ? calendarOfflineOk([], observedAt, observedAt + 30_000)
+          : calendarLiveOk([], provenance, observedAt);
+      const send = vi.fn();
+      runtime.state.win = {
+        isDestroyed: () => false,
+        webContents: { send, isDestroyed: () => false },
+      }.As<NonNullable<SchedulerRuntime["state"]["win"]>>();
+      refreshCalendarPublication.mockResolvedValue({ publicationGeneration: 1, result });
+      await poll();
+      send.mockClear();
+      refreshCalendarPublication.mockResolvedValue({ publicationGeneration: 2, result });
+
+      // When: no observation or content changed.
+      await poll();
+
+      // Then: generation alone does not trigger a push.
+      expect(send).not.toHaveBeenCalled();
+    },
+  );
 
   it.each(overrides)("re-pushes events when %s changes", async (_field, override) => {
     const evt1 = createMockEvent(baseFields);
@@ -765,8 +845,11 @@ describe("republishUiForDisplayTick", () => {
     expect(mockSend).toHaveBeenCalledTimes(1);
     mockSend.mockClear();
     // Identical content would normally skip; force path must send.
+    vi.setSystemTime(Date.now() + 60_000);
     republishUiImpl(runtime);
     expect(mockSend).toHaveBeenCalledTimes(1);
+    expect(mockSend).toHaveBeenCalledWith("calendar:result-updated", publication);
+    expect(refreshCalendarPublication).toHaveBeenCalledTimes(1);
   });
 
   it("falls back to lastKnownEvents when coordinator has no publication", async () => {
