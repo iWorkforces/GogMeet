@@ -251,4 +251,32 @@ describe("alert join and dismiss", () => {
     expect(joinMeeting).toHaveBeenCalledTimes(2);
     expect(notifyDismissed).not.toHaveBeenCalled();
   });
+
+  it("invalidates joins, keyboard actions, and the show subscription on unload", async () => {
+    // Given an unresolved join and a retained show callback.
+    const pending = Promise.withResolvers<Result<void, string>>();
+    joinMeeting.mockReturnValueOnce(pending.promise);
+    showAlert();
+    button("join").click();
+    const retainedShow = onShowAlert;
+    // When the page unloads and the old join fails.
+    window.dispatchEvent(new Event("unload"));
+    pending.resolve({ ok: false, error: "After unload" });
+    await pending.promise;
+    await Promise.resolve();
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    retainedShow?.({
+      id: asTestEventId("late"),
+      title: "Late",
+      startDate: asTestIsoUtc("2026-10-02T10:00:00Z"),
+      endDate: asTestIsoUtc("2026-10-02T10:30:00Z"),
+      calendarName: "Work",
+      isAllDay: false,
+    });
+    // Then teardown removes the subscription and makes all retained work inert.
+    expect(unsubscribe).toHaveBeenCalledOnce();
+    expect(document.getElementById("join-error")).toBeNull();
+    expect(document.querySelector(".alert-title")?.textContent).toBe("Standup");
+    expect(notifyDismissed).not.toHaveBeenCalled();
+  });
 });

@@ -419,4 +419,17 @@ describe("alert: duplicate uid coalescing (rapid showAlert calls)", () => {
     document.dispatchEvent(event);
     expect(notifyDismissed).toHaveBeenCalledExactlyOnceWith("evt-1");
   });
+
+  it("removes current keyboard and click actions on unload", async () => {
+    // Given a current presentation and its captured button.
+    const { callback, notifyDismissed } = await loadAlertModule();
+    callback(makeAlertPayload());
+    const button = document.querySelector<HTMLButtonElement>('[data-action="dismiss"]');
+    // When the presentation context unloads.
+    window.dispatchEvent(new Event("unload"));
+    document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+    button?.click();
+    // Then neither action survives teardown.
+    expect(notifyDismissed).not.toHaveBeenCalled();
+  });
 });
