@@ -8,7 +8,8 @@ import { IPC_CHANNELS } from "../../src/shared/ipc-channels.js";
 import type { IpcRendererEvent, WebContents } from "electron";
 import { asTestIsoUtc, createMockEvent, okCalendarResult } from "../helpers/test-utils.js";
 
-const loopback = vi.hoisted(() => {
+const loopback = await vi.hoisted(async () => {
+  const { runInNewContext } = await import("node:vm");
   type InvokeHandler = (event: object, ...args: readonly unknown[]) => unknown;
   type RendererListener = (event: object, payload: unknown) => void;
 
@@ -61,6 +62,17 @@ const loopback = vi.hoisted(() => {
         exposeInMainWorld: vi.fn((key: string, value: object) => {
           Object.defineProperty(window, key, { configurable: true, value });
         }),
+        executeInMainWorld: (script: {
+          readonly func: (...args: readonly unknown[]) => unknown;
+          readonly args?: readonly unknown[];
+        }) => {
+          const world = { args: script.args ?? [], window, document };
+          runInNewContext(`(${script.func.toString()})(...args)`, world);
+          Object.defineProperty(window, "api", {
+            configurable: true,
+            value: Reflect.get(world, "api"),
+          });
+        },
       },
       ipcMain: {
         handle: vi.fn((channel: string, handler: InvokeHandler) => {
