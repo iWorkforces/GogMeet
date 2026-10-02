@@ -1,6 +1,10 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { DEFAULT_SETTINGS } from "../../src/domain/entities/settings.js";
 import type { AppSettings } from "../../src/domain/entities/settings.js";
+import {
+  defaultCalendarUiState,
+  type CalendarUiState,
+} from "../../src/domain/entities/calendar-ui-state.js";
 
 /**
  * Tests for settings/index.ts
@@ -11,9 +15,41 @@ import type { AppSettings } from "../../src/domain/entities/settings.js";
  */
 
 describe("settings/index.ts", () => {
+  const documentListeners: Array<{
+    readonly type: string;
+    readonly listener: EventListenerOrEventListenerObject;
+    readonly options: boolean | AddEventListenerOptions | undefined;
+  }> = [];
+  const removeEventListener = document.removeEventListener.bind(document);
+
+  function removeRendererListeners(): void {
+    for (const { type, listener, options } of documentListeners) {
+      removeEventListener(type, listener, options);
+    }
+    documentListeners.length = 0;
+  }
+
   beforeEach(() => {
     document.body.innerHTML = '<div id="app"></div>';
     vi.restoreAllMocks();
+    vi.useFakeTimers();
+    const addEventListener = document.addEventListener.bind(document);
+    vi.spyOn(document, "addEventListener").mockImplementation((type, listener, options) => {
+      if (type === "DOMContentLoaded" || type === "visibilitychange") {
+        documentListeners.push({ type, listener, options });
+      }
+      addEventListener(type, listener, options);
+    });
+  });
+
+  afterEach(() => {
+    removeRendererListeners();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    vi.restoreAllMocks();
+    document.body.replaceChildren();
+    document.getElementById("app-icon-aurora-styles")?.remove();
   });
 
   async function loadSettingsRenderer(
@@ -22,8 +58,11 @@ describe("settings/index.ts", () => {
       getSettings?: () => Promise<AppSettings>;
       getUiState?: () => Promise<unknown>;
       onChanged?: (cb: (s: AppSettings) => void) => () => void;
+      requestPermission?: () => Promise<"granted">;
     },
   ): Promise<void> {
+    removeRendererListeners();
+    vi.clearAllTimers();
     vi.resetModules();
     const onChanged =
       options?.onChanged ??
@@ -40,6 +79,7 @@ describe("settings/index.ts", () => {
         onChanged,
       },
       calendar: {
+        requestPermission: options?.requestPermission,
         getUiState:
           options?.getUiState ??
           vi.fn().mockResolvedValue({
@@ -76,6 +116,11 @@ describe("settings/index.ts", () => {
       throw new Error("settings renderer did not render the launch-at-login toggle");
     }
     return toggle;
+  }
+
+  function refreshWhenVisible(): void {
+    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
+    document.dispatchEvent(new Event("visibilitychange"));
   }
 
   it("keeps controls wired after a successful dropdown save rerender", async () => {
@@ -243,9 +288,7 @@ describe("settings/index.ts", () => {
       late.value = "5";
       late.dispatchEvent(new Event("change"));
     }
-    await vi.waitFor(() =>
-      expect(setSettings).toHaveBeenCalledWith({ lateJoinGraceMinutes: 5 }),
-    );
+    await vi.waitFor(() => expect(setSettings).toHaveBeenCalledWith({ lateJoinGraceMinutes: 5 }));
   });
 
   it("saves quiet-hours times when enabled", async () => {
@@ -424,6 +467,180 @@ describe("settings/index.ts", () => {
     });
   });
 
+  it("keeps a newer completed save when a visibility settings GET finishes late", async () => {
+    const staleSettings = Promise.withResolvers<AppSettings>();
+    const getSettings = vi
+      .fn<() => Promise<AppSettings>>()
+      .mockResolvedValueOnce({ ...DEFAULT_SETTINGS })
+      .mockReturnValueOnce(staleSettings.promise);
+    const getUiState = vi.fn(async () => defaultCalendarUiState());
+    const setSettings = vi.fn(async (partial: Partial<AppSettings>) => ({
+      ...DEFAULT_SETTINGS,
+      ...partial,
+    }));
+    await loadSettingsRenderer(setSettings, { getSettings, getUiState });
+    refreshWhenVisible();
+    expect(getSettings).toHaveBeenCalledTimes(2);
+    const select = getOpenBeforeSelect();
+    select.value = "2";
+    select.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(getOpenBeforeSelect().value).toBe("2");
+      expect(document.getElementById("save-indicator")?.textContent).toBe("Saved");
+      expect(document.getElementById("settings-main")?.hasAttribute("aria-busy")).toBe(false);
+    });
+    const committedSelect = getOpenBeforeSelect();
+    staleSettings.resolve({ ...DEFAULT_SETTINGS });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getOpenBeforeSelect()).toBe(committedSelect);
+    expect(getOpenBeforeSelect().value).toBe("2");
+    expect(document.getElementById("save-indicator")?.textContent).toBe("Saved");
+    expect(getUiState).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a newer completed save when a visibility account GET finishes late", async () => {
+    const staleAccount = Promise.withResolvers<CalendarUiState>();
+    const getUiState = vi
+      .fn<() => Promise<CalendarUiState>>()
+      .mockResolvedValueOnce({ ...defaultCalendarUiState(), oauthConfigured: true })
+      .mockReturnValueOnce(staleAccount.promise);
+    const setSettings = vi.fn(async (partial: Partial<AppSettings>) => ({
+      ...DEFAULT_SETTINGS,
+      ...partial,
+    }));
+    await loadSettingsRenderer(setSettings, { getUiState });
+    refreshWhenVisible();
+    await vi.waitFor(() => expect(getUiState).toHaveBeenCalledTimes(2));
+    const toggle = getLaunchAtLoginToggle();
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event("change"));
+    await vi.waitFor(() => {
+      expect(document.getElementById("launch-save-indicator")?.textContent).toBe("Saved");
+      expect(document.getElementById("settings-main")?.hasAttribute("aria-busy")).toBe(false);
+    });
+    staleAccount.resolve({
+      ...defaultCalendarUiState(),
+      permission: "granted",
+      accountEmail: "stale@example.com",
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(getLaunchAtLoginToggle()).toBe(toggle);
+    expect(toggle.checked).toBe(true);
+    expect(document.getElementById("launch-save-indicator")?.textContent).toBe("Saved");
+    expect(document.getElementById("calendar-connect-btn")).toBeInstanceOf(HTMLButtonElement);
+    expect(document.body.textContent).not.toContain("stale@example.com");
+  });
+
+  it("retains committed rollback settings while a visibility account GET is pending", async () => {
+    const staleAccount = Promise.withResolvers<CalendarUiState>();
+    const getSettings = vi
+      .fn<() => Promise<AppSettings>>()
+      .mockResolvedValueOnce({ ...DEFAULT_SETTINGS })
+      .mockResolvedValueOnce({ ...DEFAULT_SETTINGS, launchAtLogin: true });
+    const getUiState = vi
+      .fn<() => Promise<CalendarUiState>>()
+      .mockResolvedValueOnce(defaultCalendarUiState())
+      .mockReturnValueOnce(staleAccount.promise);
+    const setSettings = vi.fn().mockRejectedValue(new Error("persistence failed"));
+    await loadSettingsRenderer(setSettings, { getSettings, getUiState });
+    refreshWhenVisible();
+    await vi.waitFor(() => expect(getUiState).toHaveBeenCalledTimes(2));
+    const toggle = getLaunchAtLoginToggle();
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event("change"));
+    await vi.waitFor(() =>
+      expect(document.querySelector(".settings-error")?.textContent).toBe("persistence failed"),
+    );
+    expect(getLaunchAtLoginToggle().checked).toBe(false);
+    expect(toggle.checked).toBe(false);
+    staleAccount.resolve(defaultCalendarUiState());
+    await vi.advanceTimersByTimeAsync(0);
+    expect(document.querySelector(".settings-error")?.textContent).toBe("persistence failed");
+    expect(getLaunchAtLoginToggle().checked).toBe(false);
+  });
+
+  it.each(["resolve", "reject"] as const)(
+    "keeps settings pushes when an older visibility account GET later %ss",
+    async (completion) => {
+      const staleAccount = Promise.withResolvers<CalendarUiState>();
+      const subscribed = Promise.withResolvers<(settings: AppSettings) => void>();
+      const getUiState = vi
+        .fn<() => Promise<CalendarUiState>>()
+        .mockResolvedValueOnce(defaultCalendarUiState())
+        .mockReturnValueOnce(staleAccount.promise);
+      await loadSettingsRenderer(vi.fn(), {
+        getUiState,
+        onChanged: (callback) => {
+          subscribed.resolve(callback);
+          return () => undefined;
+        },
+      });
+      refreshWhenVisible();
+      await vi.waitFor(() => expect(getUiState).toHaveBeenCalledTimes(2));
+      const push = await subscribed.promise;
+      push({ ...DEFAULT_SETTINGS, launchAtLogin: true });
+      const pushedToggle = getLaunchAtLoginToggle();
+      if (completion === "resolve") {
+        staleAccount.resolve({
+          ...defaultCalendarUiState(),
+          permission: "granted",
+          accountEmail: "stale@example.com",
+        });
+      } else {
+        staleAccount.reject(new Error("late account failure"));
+      }
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getLaunchAtLoginToggle()).toBe(pushedToggle);
+      expect(pushedToggle.checked).toBe(true);
+      expect(document.body.textContent).not.toContain("stale@example.com");
+    },
+  );
+
+  it.each(["busy", "completed"] as const)(
+    "keeps newer account work when an older visibility account GET finishes while %s",
+    async (accountWork) => {
+      const staleAccount = Promise.withResolvers<CalendarUiState>();
+      const permission = Promise.withResolvers<"granted">();
+      const currentAccount: CalendarUiState = {
+        ...defaultCalendarUiState(),
+        permission: "granted",
+        accountEmail: "current@example.com",
+      };
+      const getUiState = vi
+        .fn<() => Promise<CalendarUiState>>()
+        .mockResolvedValueOnce({ ...defaultCalendarUiState(), oauthConfigured: true })
+        .mockReturnValueOnce(staleAccount.promise)
+        .mockResolvedValueOnce(currentAccount);
+      await loadSettingsRenderer(vi.fn(), {
+        getUiState,
+        requestPermission: () => permission.promise,
+      });
+      refreshWhenVisible();
+      await vi.waitFor(() => expect(getUiState).toHaveBeenCalledTimes(2));
+      const connect = document.getElementById("calendar-connect-btn");
+      if (!(connect instanceof HTMLButtonElement)) throw new Error("Missing Connect button");
+      connect.click();
+      if (accountWork === "completed") {
+        permission.resolve("granted");
+        await vi.waitFor(() => expect(document.body.textContent).toContain("current@example.com"));
+      }
+      const currentButton = document.querySelector("#calendar-account-group button");
+      staleAccount.resolve({
+        ...defaultCalendarUiState(),
+        permission: "granted",
+        accountEmail: "stale@example.com",
+      });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.querySelector("#calendar-account-group button")).toBe(currentButton);
+      expect(document.body.textContent).not.toContain("stale@example.com");
+      if (accountWork === "busy") {
+        expect(currentButton?.hasAttribute("disabled")).toBe(true);
+        permission.resolve("granted");
+        await vi.waitFor(() => expect(document.body.textContent).toContain("current@example.com"));
+      }
+    },
+  );
+
   it("re-renders when settings.onChanged fires while idle", async () => {
     let push: ((s: AppSettings) => void) | null = null;
     const onChanged = vi.fn((cb: (s: AppSettings) => void) => {
@@ -583,20 +800,17 @@ describe("settings/index.ts", () => {
       document.body.innerHTML = '<div id="app"></div>';
     }
   });
-
 });
 
 describe("settings constants", () => {
   it("OPEN_BEFORE_MINUTES_MIN is 0", async () => {
-    expect(
-      (await import("../../src/domain/entities/settings.js")).OPEN_BEFORE_MINUTES_MIN,
-    ).toBe(0);
+    expect((await import("../../src/domain/entities/settings.js")).OPEN_BEFORE_MINUTES_MIN).toBe(0);
   });
 
   it("OPEN_BEFORE_MINUTES_MAX is 10", async () => {
-    expect(
-      (await import("../../src/domain/entities/settings.js")).OPEN_BEFORE_MINUTES_MAX,
-    ).toBe(10);
+    expect((await import("../../src/domain/entities/settings.js")).OPEN_BEFORE_MINUTES_MAX).toBe(
+      10,
+    );
   });
 
   it("range produces 5 options", () => {
@@ -666,9 +880,8 @@ describe("settings dropdown validation", () => {
   });
 
   it("open-before range matches domain constants 0–10", async () => {
-    const { OPEN_BEFORE_MINUTES_MIN, OPEN_BEFORE_MINUTES_MAX } = await import(
-      "../../src/domain/entities/settings.js"
-    );
+    const { OPEN_BEFORE_MINUTES_MIN, OPEN_BEFORE_MINUTES_MAX } =
+      await import("../../src/domain/entities/settings.js");
     expect(OPEN_BEFORE_MINUTES_MIN).toBe(0);
     expect(OPEN_BEFORE_MINUTES_MAX).toBe(10);
   });
