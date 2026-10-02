@@ -40,9 +40,8 @@ export function registerSettingsHandlers(win: BrowserWindow, graph: AppGraph): v
       partial: IpcRequest<typeof IPC_CHANNELS.SETTINGS_SET>,
     ): Promise<IpcResponse<typeof IPC_CHANNELS.SETTINGS_SET>> => {
       if (!validateSender(event)) return { ...DEFAULT_SETTINGS };
+      const updated = await graph.settings.update(partial);
       try {
-        const updated = await graph.settings.update(partial);
-
         if (settingsRequireSchedulerRestart(partial)) {
           graph.scheduler.restart();
         } else if (typeof partial.showTomorrowMeetings === "boolean") {
