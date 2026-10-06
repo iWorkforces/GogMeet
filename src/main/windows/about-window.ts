@@ -307,8 +307,7 @@ export function showAbout(_mainWindow: BrowserWindow): void {
     minimizable: false,
     maximizable: false,
     fullscreenable: false,
-    // About is not a utility HUD — avoid stealing focus from other apps permanently.
-    alwaysOnTop: false,
+    alwaysOnTop: true,
     show: false,
     ...chrome,
     webPreferences: { ...SECURE_WEB_PREFERENCES },

@@ -122,7 +122,7 @@ describe("about-window", () => {
     expect(BrowserWindow).toHaveBeenCalledTimes(1);
   });
 
-  it("uses a traffic-light-safe About size without alwaysOnTop", async () => {
+  it("uses a traffic-light-safe About size with alwaysOnTop", async () => {
     const { showAbout } = await getModule();
     const { BrowserWindow } = await getElectron();
     showAbout({} as never);
@@ -135,7 +135,7 @@ describe("about-window", () => {
     expect(options.width).toBe(320);
     expect(options.height).toBe(360);
     expect(options.resizable).toBe(false);
-    expect(options.alwaysOnTop).toBe(false);
+    expect(options.alwaysOnTop).toBe(true);
   });
 
   it("exports isSafeAboutRepositoryUrl for https-only repos", async () => {
